@@ -1,0 +1,26 @@
+# All file paths — single source of truth. No hardcoded paths in code.
+
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  synthetic_dir: "data/synthetic"
+  splits_dir: "data/splits"
+
+outputs:
+  checkpoints_dir: "outputs/checkpoints"
+  results_dir: "outputs/results"
+  figures_dir: "outputs/figures"
+  logs_dir: "outputs/logs"
+  ablations_dir: "outputs/results/ablations"
+
+config:
+  scenarios: "config/scenarios.yaml"
+  milstd: "config/milstd.yaml"
+  model: "config/model.yaml"
+
+naming:
+  avr_data_template: "avr_data_{scenario}_run{run_id}.csv"
+  fault_log_template: "fault_log_{scenario}_run{run_id}.csv"
+  checkpoint_template: "{run_id}_epoch_{epoch}.pt"
+  best_checkpoint_template: "{run_id}_best.pt"
+  results_template: "{run_id}_final.json"

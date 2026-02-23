@@ -1,0 +1,52 @@
+mil_std_1275e:
+  nominal_voltage_v: 28.0
+
+  # Starting transients
+  initial_engagement_surge:
+    voltage_drop_v: 6.0              # Minimum drop during IES
+    duration_s: 0.5                  # Up to 1.0s per standard
+    rise_time_ms: 10.0
+    recovery_time_ms: 200.0
+
+  cranking:
+    voltage_v: 16.0
+    max_duration_s: 30.0
+
+  # Spike (high voltage, short duration, low energy)
+  spike:
+    peak_voltage_v: 250.0
+    duration_us: 70.0                # 70 microseconds
+    rise_time_us: 1.0                # <1 microsecond rise
+    energy_joules: 2.0
+
+  # Load dump surge (lower voltage, long duration, high energy)
+  load_dump:
+    peak_voltage_v: 100.0
+    source_impedance_ohm: 0.5
+    duration_ms: 50.0
+    repetitions: 3
+    interval_s: 1.0
+
+  # Normal operating range (NOT faults)
+  steady_state_ripple_peak_to_peak_v: 1.5    # Max ripple under normal operation
+  transient_spike_normal_max_v: 32.5         # Normal spikes not classified as faults
+
+mil_std_810h:
+  # Category 4: Wheeled vehicles on roads (Method 514.8)
+  Category_4:
+    breakpoints_hz: [10, 40, 500]
+    psd_g2_per_hz: [0.04, 0.04, 0.01]
+    duration_minutes: 60
+
+  # Category 20: Wheeled vehicles off-road / Tracked vehicles
+  Category_20:
+    breakpoints_hz: [5, 20, 150, 500]
+    psd_g2_per_hz: [0.015, 0.015, 0.003, 0.001]
+    duration_minutes: 60
+
+  # Method 522.2: Ballistic shock SRS
+  ballistic_shock:
+    natural_frequency_hz: [100, 1000, 2000]
+    srs_acceleration_g: [20, 40, 30]
+    Q_factor: 10
+    duration_ms: 11.0

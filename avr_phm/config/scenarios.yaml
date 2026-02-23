@@ -1,0 +1,69 @@
+global:
+  sampling_frequency_hz: 10          # 10 Hz data logging
+  nominal_voltage_v: 28.0            # MIL-STD-1275E nominal 28V DC bus
+  voltage_min_threshold_v: 23.5      # Under-voltage fault threshold
+  voltage_max_threshold_v: 32.5      # Over-voltage fault threshold
+  nominal_current_a: 45.0
+  fault_log_duration_ms: 100         # Fault must persist 100ms before logging
+
+scenarios:
+  baseline:
+    duration_minutes: 120
+    runs: 4
+    ambient_temp_c: 25.0
+    temp_variation_c: 5.0
+    base_fault_probability_per_sample: 0.0005
+    vibration_psd_category: null
+    shock_srs: null
+
+  desert_heat:
+    duration_minutes: 30
+    runs: 2
+    ambient_temp_c: 65.0
+    temp_ramp_c_per_hour: 5.0        # Gradual heat buildup
+    thermal_derating_factor: 0.85    # SOA reduction at high junction temp
+    base_fault_probability_per_sample: 0.0015
+    vibration_psd_category: "Category_4"  # MIL-STD-810H wheeled vehicle
+
+  arctic_cold:
+    duration_minutes: 30
+    runs: 2
+    ambient_temp_c: -40.0
+    battery_resistance_multiplier: 3.2  # R_internal increases at cold
+    ies_events_per_hour: 2           # Initial Engagement Surges
+    base_fault_probability_per_sample: 0.001
+    vibration_psd_category: "Category_4"
+
+  artillery_firing:
+    duration_minutes: 30
+    runs: 2
+    ambient_temp_c: 45.0
+    firing_events_per_hour: 6        # Artillery discharge events
+    ballistic_shock_g_peak: 40       # SRS peak per MIL-STD-810H Method 522.2
+    base_fault_probability_per_sample: 0.002
+    vibration_psd_category: "Category_20"  # Tracked vehicle off-road
+
+  rough_terrain:
+    duration_minutes: 30
+    runs: 2
+    ambient_temp_c: 35.0
+    terrain_class: "cross_country"
+    vibration_psd_category: "Category_20"
+    base_fault_probability_per_sample: 0.0018
+
+  weapons_active:
+    duration_minutes: 30
+    runs: 2
+    ambient_temp_c: 50.0
+    load_step_amps: 80.0             # Step increase when weapons engage
+    load_dump_events_per_hour: 4     # MIL-STD-1275E load dump events
+    base_fault_probability_per_sample: 0.0025
+
+  emp_simulation:
+    duration_minutes: 30
+    runs: 2
+    ambient_temp_c: 45.0
+    emp_events: 1                    # Single EMP event mid-mission
+    emp_voltage_spike_v: 250.0       # Per MIL-STD-461
+    emp_recovery_oscillation_std: 15.0
+    base_fault_probability_per_sample: 0.005

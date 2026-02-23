@@ -1,0 +1,56 @@
+global:
+  random_seed: 42
+  device: "cuda"                     # Falls back to cpu automatically
+  mixed_precision: true
+  gradient_clipping: 1.0
+
+data:
+  window_size_samples: 100           # 10 seconds at 10Hz
+  stride_samples: 10                 # 1 second stride
+  fault_warning_horizons_s: [1, 5, 10, 30]  # Multi-horizon targets
+  voltage_forecast_steps: 10         # 1 second ahead
+
+pinn:
+  architecture: "FNN"
+  layer_sizes: [7, 128, 128, 128, 64, 3]   # 7 state inputs -> 3 outputs
+  activation: "tanh"
+  initializer: "Glorot_normal"
+  physics_loss_weight: 0.3           # lambda_2 in total loss
+  fault_loss_weight: 0.2             # lambda_3 in total loss
+  data_loss_weight: 0.5              # lambda_1 in total loss
+  learning_rate: 1.0e-4
+  batch_size: 256
+  max_epochs: 2000
+  patience: 100                      # Early stopping
+  checkpoint_every_n_epochs: 50
+
+recurrent_ae:
+  encoder_hidden: [128, 64]
+  decoder_hidden: [64, 128]
+  rnn_type: "BiGRU"
+  latent_dim: 32
+  dropout: 0.2
+  learning_rate: 1.0e-3
+  batch_size: 128
+  max_epochs: 500
+  reconstruction_threshold_sigma: 2.5  # Alert if reconstruction error > mean + 2.5*std
+
+baseline_rf:
+  n_estimators: 500
+  max_depth: 20
+  class_weight: "balanced"
+  n_jobs: -1                         # Use all CPU cores
+  min_samples_leaf: 5
+
+cgan:
+  generator_hidden: [64, 128, 64]
+  discriminator_hidden: [64, 128, 64]
+  rnn_type: "GRU"
+  latent_dim: 32
+  sequence_length: 100
+  learning_rate_g: 1.0e-4
+  learning_rate_d: 2.0e-4
+  batch_size: 32
+  max_epochs: 300
+  n_critic: 5                        # Train discriminator 5x per generator step (WGAN)
+  gradient_penalty_weight: 10.0      # WGAN-GP lambda

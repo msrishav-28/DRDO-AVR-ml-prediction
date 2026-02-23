@@ -1,0 +1,5 @@
+Feature,H-Statistic,p-value
+voltage,21837.05442951484,0.0
+current,3961.464951905611,0.0
+power,15848.883160576734,0.0
+fft_power_5_10hz,16645.13261061916,0.0
