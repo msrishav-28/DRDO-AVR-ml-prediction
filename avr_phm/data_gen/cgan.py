@@ -43,8 +43,8 @@ SCENARIOS: list[str] = [
     "rough_terrain", "weapons_active", "emp_simulation",
 ]
 FAULT_MECHANISMS: list[str] = ["none", "thyristor", "capacitor", "terminal"]
-SEVERITY_LEVELS: list[str] = ["healthy", "incipient", "critical"]
-CONDITION_DIM: int = len(SCENARIOS) + len(FAULT_MECHANISMS) + len(SEVERITY_LEVELS)  # 14
+SEVERITY_LEVELS: list[str] = ["healthy", "incipient", "developing", "critical"]
+CONDITION_DIM: int = len(SCENARIOS) + len(FAULT_MECHANISMS) + len(SEVERITY_LEVELS)  # 15
 
 
 def encode_condition(
@@ -502,31 +502,217 @@ def generate_augmentation_data(
     return synthetic.cpu().numpy()
 
 
+def build_augmentation_dataset(
+    generator: CGANGenerator,
+    n_fault_samples: int = 1000,
+    latent_dim: int = 32,
+    device_str: str = "cpu",
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Implement master plan augmentation strategy.
+
+    Purpose:
+        Generate 3× as many fault samples as healthy, then down-sample
+        to 1:4 ratio (fault:healthy) for final training set.
+
+    Inputs:
+        generator: Trained CGANGenerator.
+        n_fault_samples: Base number of fault samples to generate.
+        latent_dim: Latent noise dimension.
+        device_str: Device string.
+
+    Outputs:
+        (augmented_sequences, augmented_conditions) arrays.
+    """
+    all_sequences: list[np.ndarray] = []
+    all_conditions: list[np.ndarray] = []
+
+    # Generate 3× fault samples for each mechanism × severity combo
+    fault_combos: list[tuple[str, str]] = [
+        (mech, sev)
+        for mech in ["thyristor", "capacitor", "terminal"]
+        for sev in ["incipient", "developing", "critical"]
+    ]
+
+    samples_per_combo: int = max(1, n_fault_samples // len(fault_combos))
+
+    for mechanism, severity in fault_combos:
+        for scenario in SCENARIOS:
+            cond: np.ndarray = encode_condition(scenario, mechanism, severity)
+            seqs: np.ndarray = generate_augmentation_data(
+                generator, samples_per_combo, cond, latent_dim, device_str
+            )
+            all_sequences.append(seqs)
+            cond_batch: np.ndarray = np.tile(cond, (len(seqs), 1))
+            all_conditions.append(cond_batch)
+
+    # Also generate healthy samples (1/3 the amount)
+    healthy_per_scenario: int = max(
+        1, (n_fault_samples * 3) // (4 * len(SCENARIOS))
+    )
+    for scenario in SCENARIOS:
+        cond = encode_condition(scenario, "none", "healthy")
+        seqs = generate_augmentation_data(
+            generator, healthy_per_scenario, cond, latent_dim, device_str
+        )
+        all_sequences.append(seqs)
+        cond_batch = np.tile(cond, (len(seqs), 1))
+        all_conditions.append(cond_batch)
+
+    augmented_sequences: np.ndarray = np.concatenate(all_sequences, axis=0)
+    augmented_conditions: np.ndarray = np.concatenate(all_conditions, axis=0)
+
+    print(f"[AUGMENT] Generated {len(augmented_sequences)} augmented samples")
+    print(f"  Fault samples: ~{n_fault_samples * 3}")
+    print(f"  Healthy samples: ~{healthy_per_scenario * len(SCENARIOS)}")
+
+    return augmented_sequences, augmented_conditions
+
+
 def run_tests() -> None:
     """Sanity checks for the WGAN-GP module."""
     # Test 1: Condition encoding produces correct shape
     cond: np.ndarray = encode_condition("baseline", "none", "healthy")
-    assert cond.shape == (14,), f"Condition dim should be 14, got {cond.shape}"
+    assert cond.shape == (CONDITION_DIM,), (
+        f"Condition dim should be {CONDITION_DIM}, got {cond.shape}"
+    )
     assert cond.sum() == 3.0, "Exactly 3 entries should be 1.0"
 
     # Test 2: Generator produces correct output shape
-    gen: CGANGenerator = CGANGenerator(latent_dim=32)
+    gen: CGANGenerator = CGANGenerator(latent_dim=32, condition_dim=CONDITION_DIM)
     z: torch.Tensor = torch.randn(4, 32)
-    c: torch.Tensor = torch.zeros(4, 14)
+    c: torch.Tensor = torch.zeros(4, CONDITION_DIM)
     output: torch.Tensor = gen(z, c)
     assert output.shape == (4, 100, 3), (
         f"Generator output shape should be (4, 100, 3), got {output.shape}"
     )
 
     # Test 3: Critic produces scalar scores
-    crit: CGANCritic = CGANCritic()
+    crit: CGANCritic = CGANCritic(condition_dim=CONDITION_DIM)
     scores: torch.Tensor = crit(output.detach(), c)
     assert scores.shape == (4, 1), (
         f"Critic output should be (4, 1), got {scores.shape}"
     )
 
+    # Test 4: Developing severity is encoded correctly
+    cond_dev: np.ndarray = encode_condition("baseline", "capacitor", "developing")
+    assert cond_dev.sum() == 3.0, "Should have 3 one-hot entries"
+
     print("[PASS] data_gen/cgan.py — all tests passed.")
 
 
 if __name__ == "__main__":
-    run_tests()
+    import argparse
+    import glob
+
+    import pandas as pd
+
+    parser = argparse.ArgumentParser(description="WGAN-GP training and augmentation")
+    parser.add_argument("--test", action="store_true", help="Run sanity checks only")
+    parser.add_argument("--train", action="store_true", help="Train the cGAN")
+    parser.add_argument("--augment", action="store_true",
+                        help="Generate augmentation data using trained model")
+    parser.add_argument("--epochs", type=int, default=300, help="Max training epochs")
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
+    parser.add_argument("--data-dir", type=str, default="data/raw",
+                        help="Directory with raw CSV data")
+    parser.add_argument("--output-dir", type=str, default="data/synthetic",
+                        help="Directory for synthetic output")
+    parser.add_argument("--checkpoint-dir", type=str, default="outputs/checkpoints",
+                        help="Checkpoint directory")
+    parser.add_argument("--device", type=str, default="cpu", help="Device (cpu/cuda)")
+    args = parser.parse_args()
+
+    if args.test:
+        run_tests()
+    elif args.train:
+        # Load raw data and window it for cGAN training
+        csv_files: list[str] = sorted(glob.glob(
+            os.path.join(args.data_dir, "avr_data_*.csv")
+        ))
+        if not csv_files:
+            print(f"[ERROR] No data CSVs found in {args.data_dir}")
+            raise SystemExit(1)
+
+        print(f"[LOAD] Found {len(csv_files)} data files")
+        seq_len: int = 100
+        all_windows: list[np.ndarray] = []
+        all_conds: list[np.ndarray] = []
+
+        for csv_path in csv_files:
+            df: pd.DataFrame = pd.read_csv(csv_path)
+            # Extract scenario and determine condition
+            scenario_name: str = df["scenario"].iloc[0] if "scenario" in df.columns else "baseline"
+            # Use "none"/"healthy" as default condition (no fault info in windows)
+            cond: np.ndarray = encode_condition(scenario_name, "none", "healthy")
+
+            # Extract V, I, T columns and create sliding windows
+            cols: list[str] = ["voltage_v", "current_a", "temperature_c"]
+            if not all(c in df.columns for c in cols):
+                print(f"  [SKIP] {csv_path} — missing columns")
+                continue
+
+            data: np.ndarray = df[cols].values.astype(np.float32)
+            # Normalize per-channel
+            for ch in range(data.shape[1]):
+                ch_std: float = float(np.std(data[:, ch]))
+                ch_mean: float = float(np.mean(data[:, ch]))
+                if ch_std > 1e-10:
+                    data[:, ch] = (data[:, ch] - ch_mean) / ch_std
+
+            n_windows: int = (len(data) - seq_len) // 10  # stride 10
+            for wi in range(n_windows):
+                start: int = wi * 10
+                window: np.ndarray = data[start:start + seq_len]
+                if len(window) == seq_len:
+                    all_windows.append(window)
+                    all_conds.append(cond)
+
+            print(f"  [OK] {os.path.basename(csv_path)}: {n_windows} windows")
+
+        real_data: torch.Tensor = torch.tensor(
+            np.array(all_windows), dtype=torch.float32
+        )
+        conditions: torch.Tensor = torch.tensor(
+            np.array(all_conds), dtype=torch.float32
+        )
+        print(f"[TRAIN] {len(real_data)} windows, condition_dim={CONDITION_DIM}")
+
+        generator, critic, losses = train_cgan(
+            real_data=real_data,
+            conditions=conditions,
+            latent_dim=32,
+            batch_size=args.batch_size,
+            max_epochs=args.epochs,
+            checkpoint_dir=args.checkpoint_dir,
+            device_str=args.device,
+        )
+        print(f"[DONE] cGAN training complete. Final critic loss: "
+              f"{losses['critic_loss'][-1]:.4f}")
+
+    elif args.augment:
+        # Load trained generator and produce augmentation data
+        ckpt_path: str = os.path.join(args.checkpoint_dir, "cgan_latest.pt")
+        if not os.path.exists(ckpt_path):
+            print(f"[ERROR] No checkpoint at {ckpt_path}. Train first with --train.")
+            raise SystemExit(1)
+
+        device: torch.device = torch.device(args.device)
+        gen: CGANGenerator = CGANGenerator(
+            latent_dim=32, condition_dim=CONDITION_DIM
+        ).to(device)
+        ckpt: dict[str, Any] = torch.load(ckpt_path, map_location=device, weights_only=False)
+        gen.load_state_dict(ckpt["generator_state_dict"])
+
+        aug_seqs, aug_conds = build_augmentation_dataset(
+            gen, n_fault_samples=1000, device_str=args.device
+        )
+
+        os.makedirs(args.output_dir, exist_ok=True)
+        np.save(os.path.join(args.output_dir, "augmented_sequences.npy"), aug_seqs)
+        np.save(os.path.join(args.output_dir, "augmented_conditions.npy"), aug_conds)
+        print(f"[SAVED] Augmented data to {args.output_dir}/")
+
+    else:
+        run_tests()
+

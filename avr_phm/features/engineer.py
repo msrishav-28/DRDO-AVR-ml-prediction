@@ -126,7 +126,7 @@ def compute_rolling_features(
         Per window w: mean, std, min, max, skewness of x(t-w+1:t).
     """
     result: pd.DataFrame = df.copy()
-    channels: list[str] = ["voltage_v", "current_a"]
+    channels: list[str] = ["voltage_v", "current_a", "temperature_c"]
 
     for channel in channels:
         if channel not in result.columns:
@@ -313,7 +313,7 @@ def compute_targets(
                 elif sev_str == "critical":
                     severity_indicator[fault_idx] = 3
 
-    # Compute forward-looking fault windows
+    # Compute forward-looking fault windows (vectorized O(n))
     horizons: dict[str, int] = {
         "fault_1s": 10,
         "fault_5s": 50,
@@ -321,22 +321,41 @@ def compute_targets(
         "fault_30s": 300,
     }
 
+    # Prefix sum for O(1) range queries
+    cumsum: np.ndarray = np.concatenate(
+        [np.array([0], dtype=np.int64), np.cumsum(fault_indicator)]
+    )  # shape (n+1,)
+
     for horizon_name, horizon_samples in horizons.items():
-        labels: np.ndarray = np.zeros(n, dtype=np.int32)
-        # Reverse cumulative sum approach for efficiency
-        cumsum: np.ndarray = np.cumsum(fault_indicator[::-1])[::-1]
-        for i in range(n):
-            end_idx: int = min(i + horizon_samples, n)
-            if end_idx > i:
-                window_faults: int = int(
-                    cumsum[i] - (cumsum[end_idx] if end_idx < n else 0)
-                )
-                labels[i] = 1 if window_faults > 0 else 0
-        result[horizon_name] = labels
+        end_indices: np.ndarray = np.minimum(
+            np.arange(n) + horizon_samples, n
+        )
+        window_sums: np.ndarray = (
+            cumsum[end_indices] - cumsum[np.arange(n)]
+        )
+        result[horizon_name] = (window_sums > 0).astype(np.int32)
 
     # Fault mechanism and severity
     result["fault_mechanism"] = mechanism_indicator
     result["severity"] = severity_indicator
+
+    # ─── RUL (Remaining Useful Life) target ──────────────────────────────────
+    # RUL = time until next fault event (in seconds), capped at 300s
+    rul: np.ndarray = np.full(n, 300.0, dtype=np.float32)
+    # Find fault indices
+    fault_indices: np.ndarray = np.where(fault_indicator > 0)[0]
+    if len(fault_indices) > 0:
+        # For each sample, find distance to next fault
+        fi_ptr: int = 0
+        for i in range(n):
+            while fi_ptr < len(fault_indices) and fault_indices[fi_ptr] < i:
+                fi_ptr += 1
+            if fi_ptr < len(fault_indices):
+                rul[i] = min(
+                    float(fault_indices[fi_ptr] - i) / sampling_rate_hz,
+                    300.0,
+                )
+    result["rul_seconds"] = rul
 
     # ─── Voltage forecast targets ────────────────────────────────────────────
     for step in range(1, 11):
@@ -376,9 +395,26 @@ def engineer_all_features(
     # Step 2: Rolling statistics
     result = compute_rolling_features(result)
 
+    # Determine ambient temp from scenario for thermal stress
+    scenario_ambient_map: dict[str, float] = {
+        "baseline": 25.0,
+        "arctic_cold": -40.0,
+        "desert_heat": 65.0,
+        "artillery_firing": 45.0,
+        "rough_terrain": 35.0,
+        "weapons_active": 50.0,
+        "emp_simulation": 45.0,
+    }
+    effective_ambient: float = ambient_temp_c
+    if "scenario" in result.columns:
+        first_scenario: str = str(result["scenario"].iloc[0])
+        effective_ambient = scenario_ambient_map.get(
+            first_scenario, ambient_temp_c
+        )
+
     # Step 3: Physics-derived features
     result = compute_physics_features(
-        result, dt=dt, t_ambient_c=ambient_temp_c
+        result, dt=dt, t_ambient_c=effective_ambient
     )
 
     # Step 4: Scenario encoding
