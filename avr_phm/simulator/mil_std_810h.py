@@ -129,7 +129,7 @@ def generate_vibration_psd(
     signal: np.ndarray = np.fft.irfft(spectrum, n=n_samples)
 
     # Normalize to correct RMS
-    target_rms: float = np.sqrt(np.trapz(target_psd, freqs))
+    target_rms: float = np.sqrt(np.trapezoid(target_psd, freqs))
     if target_rms > 0.0:
         actual_rms: float = np.sqrt(np.mean(signal**2))
         if actual_rms > 1e-15:

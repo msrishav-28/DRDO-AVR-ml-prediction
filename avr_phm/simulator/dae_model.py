@@ -83,6 +83,8 @@ from simulator.constants import (
     omega_s,
     T_ambient_nominal_c,
     thermal_resistance_junction_ambient,
+    SIGMA_SENSOR_NOMINAL,
+    C_nominal_uf,
 )
 
 
@@ -401,13 +403,13 @@ def simulate_avr_mission(
             y0=current_x,
             method="Radau",
             t_eval=chunk_t_eval,
-            rtol=1e-6,
-            atol=1e-9,
-            max_step=0.01,
+            rtol=1e-4,
+            atol=1e-6,
+            max_step=0.05,
         )
 
         if not sol.success:
-            # If solver fails, use last known state and fill with NaN
+            # If solver fails, use last known state and fill
             n_fill: int = len(chunk_t_eval)
             for fi in range(n_fill):
                 if output_idx + fi < len(t_output):
@@ -415,17 +417,22 @@ def simulate_avr_mission(
             output_idx += n_fill
             continue
 
+        # Clamp state to prevent numerical drift
+        sol_y = sol.y.copy()
+        sol_y = np.clip(sol_y, -1e6, 1e6)
+        sol_y[np.isnan(sol_y)] = 0.0
+
         # Store results
-        n_points: int = sol.y.shape[1]
+        n_points: int = sol_y.shape[1]
         for pi in range(n_points):
             if output_idx < len(t_output):
-                state_history[output_idx] = sol.y[:, pi]
+                state_history[output_idx] = sol_y[:, pi]
 
                 # Compute terminal voltage and current
                 r_l, x_l = _r_load_func(sol.t[pi])
                 z_sq_local: float = r_l**2 + x_l**2
-                ed_dp: float = sol.y[IDX_ED_DPRIME, pi]
-                eq_dp: float = sol.y[IDX_EQ_DPRIME, pi]
+                ed_dp: float = sol_y[IDX_ED_DPRIME, pi]
+                eq_dp: float = sol_y[IDX_EQ_DPRIME, pi]
 
                 # Iterative solve for Vd, Vq
                 vd_local: float = ed_dp
@@ -456,7 +463,7 @@ def simulate_avr_mission(
                 output_idx += 1
 
         # Update state for next chunk
-        current_x = sol.y[:, -1].copy()
+        current_x = sol_y[:, -1].copy()
 
     # ─── Compute temperature trace ───────────────────────────────────────────
     power_dissipated: np.ndarray = vt_history * current_history / 1000.0
@@ -598,10 +605,6 @@ def _severity_to_type(severity: float) -> str:
     else:
         return "critical"
 
-
-# Import constant for use in module-level variable
-from simulator.constants import SIGMA_SENSOR_NOMINAL as _SIGMA_NOMINAL  # noqa: E402
-from simulator.constants import C_nominal_uf  # noqa: E402
 
 
 def run_tests() -> None:

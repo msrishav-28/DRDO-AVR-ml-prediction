@@ -276,4 +276,56 @@ def run_tests() -> None:
 
 
 if __name__ == "__main__":
-    run_tests()
+    import argparse
+    import glob
+
+    from config import resolve_path
+
+    parser = argparse.ArgumentParser(
+        description="AVR-PHM evaluation harness"
+    )
+    parser.add_argument(
+        "--test", action="store_true",
+        help="Run sanity checks instead of full evaluation",
+    )
+    args = parser.parse_args()
+
+    if args.test:
+        run_tests()
+    else:
+        from config import get_device, load_yaml
+        from models.pinn import AVRPINN
+
+        paths_cfg = load_yaml("paths")
+        model_cfg = load_yaml("model")
+        device_str: str = get_device()
+
+        ckpt_dir = str(resolve_path(paths_cfg["outputs"]["checkpoints_dir"]))
+        results_dir = str(resolve_path(paths_cfg["outputs"]["results_dir"]))
+
+        # Try to load best PINN checkpoint
+        best_ckpts = sorted(glob.glob(
+            os.path.join(ckpt_dir, "pinn_*_best.pt")
+        ))
+        if not best_ckpts:
+            print("[ERROR] No trained checkpoints found in "
+                  f"{ckpt_dir}. Run training first.")
+        else:
+            n_features = model_cfg["data"].get("n_input_features", 10)
+            window_size = model_cfg["data"]["window_size_samples"]
+
+            model = AVRPINN(
+                n_input_features=n_features,
+                window_size=window_size,
+            )
+            state = torch.load(
+                best_ckpts[0], map_location=device_str, weights_only=True
+            )
+            model.load_state_dict(state)
+            print(f"[LOADED] {best_ckpts[0]}")
+
+            models_dict = {"PINN": model}
+            # Placeholder: evaluation requires a test DataLoader
+            print("[INFO] Full evaluation requires test data loader. "
+                  "Use the research notebook for complete evaluation.")
+            print(f"[INFO] Found {len(best_ckpts)} checkpoint(s) in {ckpt_dir}")

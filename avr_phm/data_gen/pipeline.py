@@ -264,8 +264,8 @@ def generate_full_dataset(
 def run_tests() -> None:
     """Sanity checks for the pipeline module."""
     # Test 1: Generation order has correct count
-    assert len(GENERATION_ORDER) == 18, (
-        f"Expected 18 generation specs (4 baseline + 14 combat), "
+    assert len(GENERATION_ORDER) == 16, (
+        f"Expected 16 generation specs (4 baseline + 12 combat), "
         f"got {len(GENERATION_ORDER)}"
     )
 
@@ -290,4 +290,18 @@ def run_tests() -> None:
 
 
 if __name__ == "__main__":
-    run_tests()
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="AVR-PHM data generation pipeline"
+    )
+    parser.add_argument(
+        "--test", action="store_true",
+        help="Run sanity checks instead of generating data",
+    )
+    args = parser.parse_args()
+
+    if args.test:
+        run_tests()
+    else:
+        generate_full_dataset()

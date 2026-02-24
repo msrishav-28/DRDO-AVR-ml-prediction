@@ -280,4 +280,28 @@ def run_tests() -> None:
 
 
 if __name__ == "__main__":
-    run_tests()
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="AVR-PHM ablation study runner"
+    )
+    parser.add_argument(
+        "--test", action="store_true",
+        help="Run sanity checks instead of ablation studies",
+    )
+    args = parser.parse_args()
+
+    if args.test:
+        run_tests()
+    else:
+        print("=" * 60)
+        print("AVR-PHM ABLATION STUDIES")
+        print("=" * 60)
+        print("\nAvailable ablation configurations:")
+        for name, config in ABLATION_CONFIGS.items():
+            print(f"  {name}: {config['description']}")
+        print("\nHyperparameter sweeps:")
+        for param, values in HYPERPARAM_SWEEPS.items():
+            print(f"  {param}: {values}")
+        print("\n[INFO] Ablation runner requires train_fn and eval_fn. "
+              "Use the research notebook for full ablation studies.")
