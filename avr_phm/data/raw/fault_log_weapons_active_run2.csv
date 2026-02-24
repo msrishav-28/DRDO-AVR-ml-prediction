@@ -1,0 +1,13 @@
+timestamp,fault_type,fault_mechanism,severity,duration_ms,status,is_operational_transient
+163.63636363636363,incipient,terminal,0.1,0.0,injected,False
+327.27272727272725,incipient,terminal,0.2,0.0,injected,False
+490.90909090909093,incipient,terminal,0.3,0.0,injected,False
+654.5454545454545,developing,terminal,0.4,0.0,injected,False
+818.1818181818181,developing,terminal,0.5,0.0,injected,False
+981.8181818181819,developing,terminal,0.6,0.0,injected,False
+1145.4545454545455,critical,terminal,0.7,0.0,injected,False
+1309.090909090909,critical,terminal,0.8,0.0,injected,False
+1472.7272727272727,critical,terminal,0.9,0.0,injected,False
+1636.3636363636363,critical,terminal,1.0,0.0,injected,False
+239.02710388376752,operational_transient,load_dump,0.0,50.0,normal,True
+247.9238937084969,operational_transient,load_dump,0.0,50.0,normal,True
