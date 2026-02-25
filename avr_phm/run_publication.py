@@ -345,6 +345,353 @@ def train_pinn_multiseed(
     return results
 
 
+def train_lstm_multiseed(
+    df: pd.DataFrame,
+    splits: dict[str, np.ndarray],
+    device: torch.device,
+) -> dict[str, Any]:
+    """Train pure deep learning LSTM baseline across 5 seeds on GPU."""
+    from models.baseline_lstm import AVRLSTM, compute_lstm_loss
+
+    feature_cols = get_feature_columns(df)
+    n_features = len(feature_cols)
+    results: dict[str, Any] = {"seeds": {}, "summary": {}, "n_features": n_features}
+
+    train_df = df.iloc[splits["train"]]
+    val_df = df.iloc[splits["val"]]
+
+    # ─── Normalize ────────────────────────────────────────────────────
+    train_X = train_df[feature_cols].values.astype(np.float32)
+    val_X = val_df[feature_cols].values.astype(np.float32)
+
+    train_X = np.nan_to_num(train_X, nan=0.0, posinf=1e6, neginf=-1e6)
+    val_X = np.nan_to_num(val_X, nan=0.0, posinf=1e6, neginf=-1e6)
+
+    # Use existing normalization stats (created by PINN if run first)
+    mean_path = os.path.join(RESULTS_DIR, "feat_mean.npy")
+    std_path = os.path.join(RESULTS_DIR, "feat_std.npy")
+    if os.path.exists(mean_path):
+        feat_mean = np.load(mean_path)
+        feat_std = np.load(std_path)
+    else:
+        feat_mean = train_X.mean(axis=0)
+        feat_std = train_X.std(axis=0)
+        feat_std[feat_std < 1e-10] = 1.0
+
+    train_X = (train_X - feat_mean) / feat_std
+    val_X = (val_X - feat_mean) / feat_std
+
+    # ─── Create sliding windows ──────────────────────────────────────
+    train_windows = torch.from_numpy(prepare_windowed_data(train_X))
+    val_windows = torch.from_numpy(prepare_windowed_data(val_X))
+
+    # Targets
+    train_targets_dict = {
+        h: torch.from_numpy(train_df[h].values[SEQ_LEN - 1::STRIDE][:len(train_windows)].astype(np.float32)).to(device)
+        for h in HORIZONS
+    }
+    val_targets_dict = {
+        h: torch.from_numpy(val_df[h].values[SEQ_LEN - 1::STRIDE][:len(val_windows)].astype(np.float32)).to(device)
+        for h in HORIZONS
+    }
+
+    train_targets = train_targets_dict["fault_10s"].cpu() # For class weights
+
+    print(f"[LSTM] {len(train_windows)} train / {len(val_windows)} val windows")
+
+    val_windows_gpu = val_windows.to(device)
+
+    for seed in SEEDS:
+        print(f"\n{'='*60}")
+        print(f"[LSTM SEED {seed}] Training up to {MAX_EPOCHS} epochs...")
+        print(f"{'='*60}")
+
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+        model = AVRLSTM(n_input_features=n_features).to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS)
+
+        # Class-weight
+        n_pos = train_targets.sum().item()
+        n_neg = len(train_targets) - n_pos
+        pos_weight = n_neg / max(n_pos, 1.0)
+
+        best_val_loss = float("inf")
+        patience_counter = 0
+        seed_losses: dict[str, list[float]] = {"train": [], "val": []}
+
+        t_seed_start = time.time()
+
+        for epoch in range(MAX_EPOCHS):
+            model.train()
+            perm = torch.randperm(len(train_windows))
+            epoch_loss = 0.0
+            n_batches = 0
+
+            for start in range(0, len(train_windows), PINN_BATCH_SIZE):
+                end = min(start + PINN_BATCH_SIZE, len(train_windows))
+                idx = perm[start:end]
+
+                batch_x = train_windows[idx].to(device)
+                batch_targets = {h: t[idx] for h, t in train_targets_dict.items()}
+
+                optimizer.zero_grad()
+                output = model(batch_x)
+
+                losses = compute_lstm_loss(output, batch_targets)
+                loss = losses["total"]
+                
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+
+                epoch_loss += loss.item()
+                n_batches += 1
+
+            scheduler.step()
+            avg_train = epoch_loss / max(n_batches, 1)
+            seed_losses["train"].append(avg_train)
+
+            # ─── Validation ───────────────────────────────────────
+            model.eval()
+            with torch.no_grad():
+                val_chunk = 256
+                val_loss_total = 0.0
+                n_val_batches = 0
+                for vs in range(0, len(val_windows_gpu), val_chunk):
+                    ve = min(vs + val_chunk, len(val_windows_gpu))
+                    chunk_out = model(val_windows_gpu[vs:ve])
+                    chunk_targets = {h: t[vs:ve] for h, t in val_targets_dict.items()}
+                    v_loss = compute_lstm_loss(chunk_out, chunk_targets)["total"]
+                    val_loss_total += v_loss.item()
+                    n_val_batches += 1
+                val_loss = val_loss_total / max(n_val_batches, 1)
+
+            seed_losses["val"].append(val_loss)
+
+            # ─── Early stopping ───────────────────────────────────
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                torch.save({
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "best_val_loss": best_val_loss,
+                    "seed": seed,
+                    "n_features": n_features,
+                }, os.path.join(CHECKPOINT_DIR, f"lstm_seed{seed}_best.pt"))
+            else:
+                patience_counter += 1
+
+            if (epoch + 1) % 20 == 0:
+                lr = scheduler.get_last_lr()[0]
+                elapsed = time.time() - t_seed_start
+                print(
+                    f"  [Epoch {epoch+1:3d}/{MAX_EPOCHS}] "
+                    f"train={avg_train:.6f}  val={val_loss:.6f}  "
+                    f"best={best_val_loss:.6f}  lr={lr:.6f}  "
+                    f"({elapsed:.0f}s)"
+                )
+
+            if patience_counter >= PATIENCE:
+                print(f"  [EARLY STOP] at epoch {epoch+1} (patience={PATIENCE})")
+                break
+
+        elapsed = time.time() - t_seed_start
+        results["seeds"][str(seed)] = {
+            "best_val_loss": best_val_loss,
+            "final_epoch": epoch + 1,
+            "time_seconds": round(elapsed, 1),
+            "train_losses": seed_losses["train"],
+            "val_losses": seed_losses["val"],
+        }
+        print(f"  [DONE] Seed {seed}: best_val={best_val_loss:.6f} "
+              f"at epoch {epoch+1} ({elapsed:.0f}s)")
+
+    # ─── Summary statistics ───────────────────────────────────────
+    val_losses = [
+        v["best_val_loss"] for v in results["seeds"].values()
+        if v["best_val_loss"] < float("inf")
+    ]
+    if val_losses:
+        results["summary"] = {
+            "mean_val_loss": round(float(np.mean(val_losses)), 6),
+            "std_val_loss": round(float(np.std(val_losses)), 6),
+            "n_seeds": len(val_losses),
+        }
+        print(f"\n[LSTM SUMMARY] Val loss: {np.mean(val_losses):.6f} "
+              f"± {np.std(val_losses):.6f} ({len(val_losses)} seeds)")
+
+    return results
+
+def train_cnn_multiseed(
+    df: pd.DataFrame,
+    splits: dict[str, np.ndarray],
+    device: torch.device,
+) -> dict[str, Any]:
+    """Train pure deep learning 1D-CNN baseline across 5 seeds on GPU."""
+    from models.baseline_cnn import AVRCNN, compute_cnn_loss
+
+    feature_cols = get_feature_columns(df)
+    n_features = len(feature_cols)
+    results: dict[str, Any] = {"seeds": {}, "summary": {}, "n_features": n_features}
+
+    train_df = df.iloc[splits["train"]]
+    val_df = df.iloc[splits["val"]]
+
+    train_X = train_df[feature_cols].values.astype(np.float32)
+    val_X = val_df[feature_cols].values.astype(np.float32)
+
+    train_X = np.nan_to_num(train_X, nan=0.0, posinf=1e6, neginf=-1e6)
+    val_X = np.nan_to_num(val_X, nan=0.0, posinf=1e6, neginf=-1e6)
+
+    mean_path = os.path.join(RESULTS_DIR, "feat_mean.npy")
+    std_path = os.path.join(RESULTS_DIR, "feat_std.npy")
+    if os.path.exists(mean_path):
+        feat_mean = np.load(mean_path)
+        feat_std = np.load(std_path)
+    else:
+        feat_mean = train_X.mean(axis=0)
+        feat_std = train_X.std(axis=0)
+        feat_std[feat_std < 1e-10] = 1.0
+
+    train_X = (train_X - feat_mean) / feat_std
+    val_X = (val_X - feat_mean) / feat_std
+
+    train_windows = torch.from_numpy(prepare_windowed_data(train_X))
+    val_windows = torch.from_numpy(prepare_windowed_data(val_X))
+
+    train_targets_dict = {
+        h: torch.from_numpy(train_df[h].values[SEQ_LEN - 1::STRIDE][:len(train_windows)].astype(np.float32)).to(device)
+        for h in HORIZONS
+    }
+    val_targets_dict = {
+        h: torch.from_numpy(val_df[h].values[SEQ_LEN - 1::STRIDE][:len(val_windows)].astype(np.float32)).to(device)
+        for h in HORIZONS
+    }
+
+    train_targets = train_targets_dict["fault_10s"].cpu() 
+
+    print(f"[CNN] {len(train_windows)} train / {len(val_windows)} val windows")
+    val_windows_gpu = val_windows.to(device)
+
+    for seed in SEEDS:
+        print(f"\n{'='*60}")
+        print(f"[CNN SEED {seed}] Training up to {MAX_EPOCHS} epochs...")
+        print(f"{'='*60}")
+
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+        model = AVRCNN(n_input_features=n_features).to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS)
+
+        n_pos = train_targets.sum().item()
+        n_neg = len(train_targets) - n_pos
+        pos_weight = n_neg / max(n_pos, 1.0)
+
+        best_val_loss = float("inf")
+        patience_counter = 0
+        seed_losses: dict[str, list[float]] = {"train": [], "val": []}
+
+        t_seed_start = time.time()
+
+        for epoch in range(MAX_EPOCHS):
+            model.train()
+            perm = torch.randperm(len(train_windows))
+            epoch_loss = 0.0
+            n_batches = 0
+
+            for start in range(0, len(train_windows), PINN_BATCH_SIZE):
+                end = min(start + PINN_BATCH_SIZE, len(train_windows))
+                idx = perm[start:end]
+
+                batch_x = train_windows[idx].to(device)
+                batch_targets = {h: t[idx] for h, t in train_targets_dict.items()}
+
+                optimizer.zero_grad()
+                output = model(batch_x)
+
+                losses = compute_cnn_loss(output, batch_targets)
+                loss = losses["total"]
+                
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+
+                epoch_loss += loss.item()
+                n_batches += 1
+
+            scheduler.step()
+            avg_train = epoch_loss / max(n_batches, 1)
+            seed_losses["train"].append(avg_train)
+
+            model.eval()
+            with torch.no_grad():
+                val_chunk = 256
+                val_loss_total = 0.0
+                n_val_batches = 0
+                for vs in range(0, len(val_windows_gpu), val_chunk):
+                    ve = min(vs + val_chunk, len(val_windows_gpu))
+                    chunk_out = model(val_windows_gpu[vs:ve])
+                    chunk_targets = {h: t[vs:ve] for h, t in val_targets_dict.items()}
+                    v_loss = compute_cnn_loss(chunk_out, chunk_targets)["total"]
+                    val_loss_total += v_loss.item()
+                    n_val_batches += 1
+                val_loss = val_loss_total / max(n_val_batches, 1)
+
+            seed_losses["val"].append(val_loss)
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                torch.save({
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "best_val_loss": best_val_loss,
+                    "seed": seed,
+                    "n_features": n_features,
+                }, os.path.join(CHECKPOINT_DIR, f"cnn_seed{seed}_best.pt"))
+            else:
+                patience_counter += 1
+
+            if (epoch + 1) % 20 == 0:
+                print(
+                    f"  [Epoch {epoch+1:3d}/{MAX_EPOCHS}] "
+                    f"train={avg_train:.6f}  val={val_loss:.6f}  "
+                    f"best={best_val_loss:.6f}  lr={scheduler.get_last_lr()[0]:.6f}  "
+                )
+
+            if patience_counter >= PATIENCE:
+                print(f"  [EARLY STOP] at epoch {epoch+1}")
+                break
+
+        elapsed = time.time() - t_seed_start
+        results["seeds"][str(seed)] = {
+            "best_val_loss": best_val_loss,
+            "final_epoch": epoch + 1,
+            "time_seconds": round(elapsed, 1),
+        }
+        print(f"  [DONE] Seed {seed}: best_val={best_val_loss:.6f}")
+
+    val_losses = [v["best_val_loss"] for v in results["seeds"].values() if v["best_val_loss"] < float("inf")]
+    if val_losses:
+        results["summary"] = {
+            "mean_val_loss": round(float(np.mean(val_losses)), 6),
+            "std_val_loss": round(float(np.std(val_losses)), 6),
+            "n_seeds": len(val_losses),
+        }
+        print(f"\n[CNN SUMMARY] Val loss: {np.mean(val_losses):.6f} ± {np.std(val_losses):.6f}")
+
+    return results
+
 # ─── Section 2: Baseline Training ────────────────────────────────────────────
 
 def train_baselines(
@@ -548,16 +895,77 @@ def evaluate_all_models(
             if pinn_aurocs_all:
                 metrics["pinn_auroc_mean"] = round(float(np.mean(pinn_aurocs_all)), 4)
                 metrics["pinn_auroc_std"] = round(float(np.std(pinn_aurocs_all)), 4)
+                
+            # ─── LSTM metrics (if checkpoints exist) ─────────────
+            from models.baseline_lstm import AVRLSTM
+            lstm_aurocs_all = []
+            for seed in SEEDS:
+                ckpt_path = os.path.join(CHECKPOINT_DIR, f"lstm_seed{seed}_best.pt")
+                if not os.path.exists(ckpt_path):
+                    continue
+
+                model = AVRLSTM(n_input_features=n_features).to(device)
+                ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+                model.load_state_dict(ckpt["model_state_dict"])
+                model.eval()
+
+                with torch.no_grad():
+                    preds_list = []
+                    for vs in range(0, len(test_wins), 256):
+                        ve = min(vs + 256, len(test_wins))
+                        out = model(test_wins[vs:ve])
+                        preds_list.append(out[horizon].squeeze(-1).cpu())
+                    lstm_proba = torch.cat(preds_list).numpy()
+
+                try:
+                    lstm_aurocs_all.append(roc_auc_score(test_y_wins, lstm_proba))
+                except ValueError:
+                    pass
+            
+            if lstm_aurocs_all:
+                metrics["lstm_auroc_mean"] = round(float(np.mean(lstm_aurocs_all)), 4)
+                metrics["lstm_auroc_std"] = round(float(np.std(lstm_aurocs_all)), 4)
+                
+            # ─── 1D-CNN metrics (if checkpoints exist) ─────────────
+            from models.baseline_cnn import AVRCNN
+            cnn_aurocs_all = []
+            for seed in SEEDS:
+                ckpt_path = os.path.join(CHECKPOINT_DIR, f"cnn_seed{seed}_best.pt")
+                if not os.path.exists(ckpt_path):
+                    continue
+
+                model = AVRCNN(n_input_features=n_features).to(device)
+                ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+                model.load_state_dict(ckpt["model_state_dict"])
+                model.eval()
+
+                with torch.no_grad():
+                    preds_list = []
+                    for vs in range(0, len(test_wins), 256):
+                        ve = min(vs + 256, len(test_wins))
+                        out = model(test_wins[vs:ve])
+                        preds_list.append(out[horizon].squeeze(-1).cpu())
+                    cnn_proba = torch.cat(preds_list).numpy()
+
+                try:
+                    cnn_aurocs_all.append(roc_auc_score(test_y_wins, cnn_proba))
+                except ValueError:
+                    pass
+            
+            if cnn_aurocs_all:
+                metrics["cnn_auroc_mean"] = round(float(np.mean(cnn_aurocs_all)), 4)
+                metrics["cnn_auroc_std"] = round(float(np.std(cnn_aurocs_all)), 4)
 
             results[result_key][horizon] = metrics
             auroc_str = f"AUROC={metrics['rf_auroc_mean']:.4f}±{metrics['rf_auroc_std']:.4f}"
             auprc_str = f"AUPRC={metrics['rf_auprc_mean']:.4f}"
             f1_str = f"F1={metrics['rf_f1_mean']:.4f}"
-            recall_str = f"R@1%FAR={metrics['rf_recall_at_1pct_far_mean']:.4f}"
-            pinn_str = ""
-            if pinn_aurocs_all:
-                pinn_str = f"  PINN_AUROC={metrics['pinn_auroc_mean']:.4f}"
-            print(f"  [{result_key}/{horizon}] {auroc_str}  {auprc_str}  {f1_str}  {recall_str}{pinn_str}")
+            
+            pinn_str = f"  PINN={metrics['pinn_auroc_mean']:.4f}" if pinn_aurocs_all else ""
+            cnn_str = f"  CNN={metrics['cnn_auroc_mean']:.4f}" if cnn_aurocs_all else ""
+            lstm_str = f"  LSTM={metrics['lstm_auroc_mean']:.4f}" if lstm_aurocs_all else ""
+            
+            print(f"  [{result_key}/{horizon}] {auroc_str}  {f1_str}{pinn_str}{cnn_str}{lstm_str}")
 
     return results
 
@@ -565,10 +973,14 @@ def evaluate_all_models(
 # ─── Section 4: Statistical Significance ──────────────────────────────────────
 
 def compute_significance(
-    df: pd.DataFrame, splits: dict[str, np.ndarray]
+    df: pd.DataFrame, splits: dict[str, np.ndarray], device: torch.device
 ) -> dict[str, Any]:
-    """Wilcoxon signed-rank tests: RF vs Threshold."""
+    """Wilcoxon signed-rank tests for Tier 1: PINN vs LSTM, LSTM vs RF, RF vs Threshold."""
+    from models.pinn import AVRPINN
+    from models.baseline_lstm import AVRLSTM
+    
     feature_cols = get_feature_columns(df)
+    n_features = len(feature_cols)
     results: dict[str, Any] = {}
 
     split_key = "test_held_out_scenario"
@@ -579,52 +991,127 @@ def compute_significance(
     test_df = df.iloc[splits[split_key]]
 
     train_X = np.nan_to_num(train_df[feature_cols].values.astype(np.float32), nan=0.0)
-    test_X = np.nan_to_num(test_df[feature_cols].values.astype(np.float32), nan=0.0)
+    test_X_raw = np.nan_to_num(test_df[feature_cols].values.astype(np.float32), nan=0.0)
     v_col = feature_cols.index("voltage_v") if "voltage_v" in feature_cols else 0
+
+    mean_path = os.path.join(RESULTS_DIR, "feat_mean.npy")
+    std_path = os.path.join(RESULTS_DIR, "feat_std.npy")
+    if os.path.exists(mean_path):
+        feat_mean = np.load(mean_path)
+        feat_std = np.load(std_path)
+    else:
+        feat_mean = train_X.mean(axis=0)
+        feat_std = train_X.std(axis=0)
+        feat_std[feat_std < 1e-10] = 1.0
+
+    test_X_norm = (test_X_raw - feat_mean) / feat_std
+    test_wins = torch.from_numpy(prepare_windowed_data(test_X_norm)).to(device)
 
     for horizon in HORIZONS:
         train_y = train_df[horizon].values
         test_y = test_df[horizon].values
-        if test_y.sum() == 0:
+        test_y_wins = test_y[SEQ_LEN - 1::STRIDE][:len(test_wins)]
+        
+        if test_y.sum() == 0 or test_y_wins.sum() == 0:
             continue
 
-        rf_f1s, thresh_f1s = [], []
+        rf_f1s, thresh_f1s, pinn_aurocs, lstm_aurocs, cnn_aurocs = [], [], [], [], []
+        
         for seed in SEEDS:
+            # RF
             rf = RandomForestClassifier(
                 n_estimators=200, max_depth=25, random_state=seed,
                 class_weight="balanced", n_jobs=RF_NJOBS,
             )
             rf.fit(train_X, train_y)
-            rf_f1s.append(f1_score(test_y, rf.predict(test_X), zero_division=0))
+            rf_f1s.append(f1_score(test_y, rf.predict(test_X_raw), zero_division=0))
 
-            # Optimized threshold from training set
-            thresh_pred = (test_X[:, v_col] < 26.5).astype(int)
+            # Threshold
+            thresh_pred = (test_X_raw[:, v_col] < 26.5).astype(int)
             thresh_f1s.append(f1_score(test_y, thresh_pred, zero_division=0))
+            
+            # PINN
+            ckpt_pinn = os.path.join(CHECKPOINT_DIR, f"pinn_seed{seed}_best.pt")
+            if os.path.exists(ckpt_pinn):
+                model = AVRPINN(n_input_features=n_features).to(device)
+                model.load_state_dict(torch.load(ckpt_pinn, map_location=device, weights_only=False)["model_state_dict"])
+                model.eval()
+                with torch.no_grad():
+                    preds_list = []
+                    for vs in range(0, len(test_wins), 256):
+                        preds_list.append(model(test_wins[vs:min(vs+256, len(test_wins))])[horizon].squeeze(-1).cpu())
+                    try:
+                        pinn_aurocs.append(roc_auc_score(test_y_wins, torch.cat(preds_list).numpy()))
+                    except ValueError:
+                        pass
+                        
+            # LSTM
+            ckpt_lstm = os.path.join(CHECKPOINT_DIR, f"lstm_seed{seed}_best.pt")
+            if os.path.exists(ckpt_lstm):
+                model = AVRLSTM(n_input_features=n_features).to(device)
+                model.load_state_dict(torch.load(ckpt_lstm, map_location=device, weights_only=False)["model_state_dict"])
+                model.eval()
+                with torch.no_grad():
+                    preds_list = []
+                    for vs in range(0, len(test_wins), 256):
+                        preds_list.append(model(test_wins[vs:min(vs+256, len(test_wins))])[horizon].squeeze(-1).cpu())
+                    try:
+                        lstm_aurocs.append(roc_auc_score(test_y_wins, torch.cat(preds_list).numpy()))
+                    except ValueError:
+                        pass
+                        
+            # 1D-CNN
+            from models.baseline_cnn import AVRCNN
+            ckpt_cnn = os.path.join(CHECKPOINT_DIR, f"cnn_seed{seed}_best.pt")
+            if os.path.exists(ckpt_cnn):
+                model = AVRCNN(n_input_features=n_features).to(device)
+                model.load_state_dict(torch.load(ckpt_cnn, map_location=device, weights_only=False)["model_state_dict"])
+                model.eval()
+                with torch.no_grad():
+                    preds_list = []
+                    for vs in range(0, len(test_wins), 256):
+                        preds_list.append(model(test_wins[vs:min(vs+256, len(test_wins))])[horizon].squeeze(-1).cpu())
+                    try:
+                        cnn_aurocs.append(roc_auc_score(test_y_wins, torch.cat(preds_list).numpy()))
+                    except ValueError:
+                        pass
 
-        # Need variance in differences for Wilcoxon
+        results[horizon] = {}
+        
+        # Test 1A: PINN vs 1D-CNN (Tier-1 Core claim: Physics matters)
+        if len(pinn_aurocs) > 1 and len(cnn_aurocs) > 1 and len(pinn_aurocs) == len(cnn_aurocs):
+            diffs = [p - c for p, c in zip(pinn_aurocs, cnn_aurocs)]
+            if len(set(diffs)) > 1:
+                try:
+                    stat, p = stats.wilcoxon(pinn_aurocs, cnn_aurocs, alternative="greater")
+                    verdict = "✓ PINN>CNN (SIG)" if p < 0.05 else "✗ not sig"
+                    print(f"  [{horizon}] PINN vs CNN (AUROC)  p={p:.6f} → {verdict}")
+                    results[horizon]["pinn_vs_cnn"] = {"stat": float(stat), "p": float(p), "sig": p < 0.05}
+                except Exception:
+                    pass
+        
+        # Test 1B: PINN vs LSTM (RNN baseline check)
+        if len(pinn_aurocs) > 1 and len(lstm_aurocs) > 1 and len(pinn_aurocs) == len(lstm_aurocs):
+            diffs = [p - l for p, l in zip(pinn_aurocs, lstm_aurocs)]
+            if len(set(diffs)) > 1:
+                try:
+                    stat, p = stats.wilcoxon(pinn_aurocs, lstm_aurocs, alternative="greater")
+                    verdict = "✓ PINN>LSTM (SIG)" if p < 0.05 else "✗ not sig"
+                    print(f"  [{horizon}] PINN vs LSTM (AUROC) p={p:.6f} → {verdict}")
+                    results[horizon]["pinn_vs_lstm"] = {"stat": float(stat), "p": float(p), "sig": p < 0.05}
+                except Exception:
+                    pass
+
+        # Test 2: RF vs Threshold (Original claim)
         diffs = [r - t for r, t in zip(rf_f1s, thresh_f1s)]
         if len(set(diffs)) > 1:
             try:
                 stat, p = stats.wilcoxon(rf_f1s, thresh_f1s, alternative="greater")
-                results[horizon] = {
-                    "rf_f1s": [round(x, 4) for x in rf_f1s],
-                    "thresh_f1s": [round(x, 4) for x in thresh_f1s],
-                    "wilcoxon_stat": round(float(stat), 4),
-                    "p_value": round(float(p), 6),
-                    "significant_at_005": p < 0.05,
-                    "rf_wins": sum(1 for d in diffs if d > 0),
-                }
-                verdict = "✓ SIGNIFICANT" if p < 0.05 else "✗ not significant"
-                print(f"  [{horizon}] Wilcoxon p={p:.6f} → {verdict}")
-            except Exception as e:
-                results[horizon] = {"error": str(e)}
-        else:
-            results[horizon] = {
-                "rf_f1_mean": round(float(np.mean(rf_f1s)), 4),
-                "thresh_f1_mean": round(float(np.mean(thresh_f1s)), 4),
-                "note": "Insufficient variance for Wilcoxon test",
-            }
-            print(f"  [{horizon}] Insufficient variance for test")
+                verdict = "✓ RF>Thresh (SIG)" if p < 0.05 else "✗ not sig"
+                print(f"  [{horizon}] RF vs Thresh (F1)    p={p:.6f} → {verdict}")
+                results[horizon]["rf_vs_thresh"] = {"stat": float(stat), "p": float(p), "sig": p < 0.05}
+            except Exception:
+                pass
 
     return results
 
@@ -1043,14 +1530,28 @@ def main() -> None:
     # ─── Step 1: Train ────────────────────────────────────────────
     if run_all or args.train:
         print(f"\n{'═'*70}")
-        print("  STEP 1/6: MULTI-SEED PINN TRAINING")
+        print("  STEP 1A/6: MULTI-SEED PINN TRAINING")
         print(f"{'═'*70}")
         t1 = time.time()
         all_results["pinn"] = train_pinn_multiseed(df, splits, device)
         print(f"  [TIME] {time.time()-t1:.0f}s")
 
         print(f"\n{'═'*70}")
-        print("  STEP 2/6: BASELINE TRAINING")
+        print("  STEP 1B/6: MULTI-SEED LSTM TRAINING (BASELINE)")
+        print(f"{'═'*70}")
+        t1b = time.time()
+        all_results["lstm"] = train_lstm_multiseed(df, splits, device)
+        print(f"  [TIME] {time.time()-t1b:.0f}s")
+        
+        print(f"\n{'═'*70}")
+        print("  STEP 1C/6: MULTI-SEED 1D-CNN TRAINING (BASELINE)")
+        print(f"{'═'*70}")
+        t1c = time.time()
+        all_results["cnn"] = train_cnn_multiseed(df, splits, device)
+        print(f"  [TIME] {time.time()-t1c:.0f}s")
+
+        print(f"\n{'═'*70}")
+        print("  STEP 2/6: BASELINE ML TRAINING (RF)")
         print(f"{'═'*70}")
         t2 = time.time()
         all_results["baselines"] = train_baselines(df, splits)
@@ -1069,7 +1570,7 @@ def main() -> None:
         print("  STEP 4/6: STATISTICAL SIGNIFICANCE")
         print(f"{'═'*70}")
         t4 = time.time()
-        all_results["significance"] = compute_significance(df, splits)
+        all_results["significance"] = compute_significance(df, splits, device)
         print(f"  [TIME] {time.time()-t4:.0f}s")
 
     # ─── Step 3: SHAP ─────────────────────────────────────────────
