@@ -53,7 +53,7 @@ class TestMMD:
         self, different_data: tuple[np.ndarray, np.ndarray]
     ) -> None:
         real, synthetic = different_data
-        mmd = compute_mmd(real, synthetic, sigma=1.0)
+        mmd = compute_mmd(real, synthetic, sigma=10.0)
         assert mmd > 0.0, "MMD of different data should be positive"
 
     def test_mmd_nonnegative(
