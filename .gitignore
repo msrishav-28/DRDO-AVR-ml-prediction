@@ -7,6 +7,9 @@ dist/
 build/
 *.egg
 
+# Large generated data (exceeds GitHub 100MB limit)
+avr_phm/data/featured/
+avr_phm/data/synthetic/
 
 
 # Environment
