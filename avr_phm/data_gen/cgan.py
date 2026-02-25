@@ -306,6 +306,7 @@ def train_cgan(
     gp_weight: float = 10.0,
     checkpoint_dir: str = "outputs/checkpoints",
     device_str: str = "cpu",
+    use_wandb: bool = False,
 ) -> tuple[CGANGenerator, CGANCritic, dict[str, list[float]]]:
     """
     Train the WGAN-GP model.
@@ -337,6 +338,39 @@ def train_cgan(
             Generator loss: -E[D(fake)]
     """
     device: torch.device = torch.device(device_str)
+
+    # ─── W&B Initialization ──────────────────────────────────────────────────
+    wandb_run: Any = None
+    if use_wandb:
+        try:
+            import wandb
+
+            wandb_config: dict[str, Any] = {
+                "model": "WGAN-GP",
+                "latent_dim": latent_dim,
+                "batch_size": batch_size,
+                "max_epochs": max_epochs,
+                "n_critic": n_critic,
+                "lr_g": lr_g,
+                "lr_d": lr_d,
+                "gp_weight": gp_weight,
+                "n_samples": len(real_data),
+                "condition_dim": conditions.shape[1],
+                "device": device_str,
+            }
+            wandb_run = wandb.init(
+                project="avr-phm-cgan",
+                config=wandb_config,
+                tags=["cgan", "wgan-gp", "augmentation"],
+                resume="allow",
+            )
+            print(f"[WANDB] Initialized run: {wandb_run.name}")
+        except ImportError:
+            print("[WANDB] wandb not installed, logging disabled")
+            use_wandb = False
+        except Exception as e:
+            print(f"[WANDB] Failed to init: {e}, logging disabled")
+            use_wandb = False
 
     generator: CGANGenerator = CGANGenerator(
         latent_dim=latent_dim,
@@ -385,6 +419,8 @@ def train_cgan(
     for epoch in range(start_epoch, max_epochs):
         epoch_c_loss: float = 0.0
         epoch_g_loss: float = 0.0
+        epoch_gp: float = 0.0
+        epoch_wasserstein: float = 0.0
         n_batches: int = 0
 
         for batch_real, batch_cond in dataloader:
@@ -432,12 +468,34 @@ def train_cgan(
 
             epoch_c_loss += c_loss.item()
             epoch_g_loss += g_loss.item()
+            epoch_gp += gp.item()
+            # Wasserstein distance estimate: E[D(real)] - E[D(fake)]
+            epoch_wasserstein += (
+                score_real.mean() - score_fake.mean()
+            ).item()
             n_batches += 1
 
         # Log epoch losses
         if n_batches > 0:
-            losses["critic_loss"].append(epoch_c_loss / n_batches)
-            losses["generator_loss"].append(epoch_g_loss / n_batches)
+            avg_c: float = epoch_c_loss / n_batches
+            avg_g: float = epoch_g_loss / n_batches
+            avg_gp: float = epoch_gp / n_batches
+            avg_w: float = epoch_wasserstein / n_batches
+            losses["critic_loss"].append(avg_c)
+            losses["generator_loss"].append(avg_g)
+
+            if use_wandb:
+                try:
+                    import wandb
+                    wandb.log({
+                        "epoch": epoch,
+                        "cgan/critic_loss": avg_c,
+                        "cgan/generator_loss": avg_g,
+                        "cgan/gradient_penalty": avg_gp,
+                        "cgan/wasserstein_distance": avg_w,
+                    })
+                except Exception:
+                    pass  # Don't crash training on W&B errors
 
         # Print progress
         if (epoch + 1) % 10 == 0:
@@ -461,6 +519,15 @@ def train_cgan(
                 ckpt_path,
             )
             print(f"[CHECKPOINT] Saved at epoch {epoch+1}")
+
+    # ─── Finalize W&B ────────────────────────────────────────────────────────
+    if use_wandb and wandb_run is not None:
+        try:
+            import wandb
+            wandb.finish()
+            print("[WANDB] Run finished")
+        except Exception:
+            pass
 
     return generator, critic, losses
 
@@ -621,6 +688,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint-dir", type=str, default="outputs/checkpoints",
                         help="Checkpoint directory")
     parser.add_argument("--device", type=str, default="cpu", help="Device (cpu/cuda)")
+    parser.add_argument("--wandb", action="store_true", help="Enable W&B logging")
     args = parser.parse_args()
 
     if args.test:
@@ -686,6 +754,7 @@ if __name__ == "__main__":
             max_epochs=args.epochs,
             checkpoint_dir=args.checkpoint_dir,
             device_str=args.device,
+            use_wandb=args.wandb,
         )
         print(f"[DONE] cGAN training complete. Final critic loss: "
               f"{losses['critic_loss'][-1]:.4f}")
