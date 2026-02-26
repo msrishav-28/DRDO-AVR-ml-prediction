@@ -336,6 +336,8 @@ x = [delta, omega, Eq', Ed', Eq'', Ed'', Vf, Vr]^T
 |-------|------|---------------|
 | Threshold | Rule-based | V_under=23.5V, V_over=32.5V |
 | Random Forest | Ensemble | 500 trees, max_depth=20, balanced |
+| 1D-CNN | Deep Learning | 3-layer CNN (kernel=5, 64 filters) + GAP (Physics Ablation) |
+| LSTM | Deep Learning | 2-layer LSTM (hidden=64, dropout=0.15) |
 | Recurrent AE | Unsupervised | BiGRU [128,64], latent=32, threshold=mean+2.5*std |
 | PatchTST | Transformer | patch=16, stride=8, 4 heads, 2 layers |
 
