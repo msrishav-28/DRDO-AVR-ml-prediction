@@ -143,6 +143,8 @@ def focal_loss(
     gamma: float = 2.0,
     alpha: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    logits = logits.squeeze(-1)
+    
     bce = F.binary_cross_entropy_with_logits(
         logits, targets, reduction="none"
     )

@@ -1,0 +1,2 @@
+number,value,datetime_start,datetime_complete,duration,params_batch_size,params_dropout_rate,params_focal_loss_gamma,params_lr,params_physics_weight,state
+0,0.49559477664947876,2026-02-27 10:38:07.090970,2026-02-27 11:21:41.821122,0 days 00:43:34.730152,1024,0.3754465657806357,2.4499329148779,0.003811708869516452,0.3535698122111164,COMPLETE

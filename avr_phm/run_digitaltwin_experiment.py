@@ -17,15 +17,38 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 
-from config import get_device, HORIZONS, SEQ_LEN, STRIDE
-from features.engineer import get_feature_columns
-from experiments.evaluate import prepare_windowed_data
+from config import get_device
+
+# Hardcoded config for independence
+HORIZONS = ["fault_1s", "fault_5s", "fault_10s", "fault_30s"]
+SEQ_LEN = 100
+STRIDE = 1
 from models.tier_1_concepts import DigitalTwinPINN
 
 warnings.filterwarnings("ignore")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data/featured")
+
+def get_feature_columns(df: pd.DataFrame) -> list[str]:
+    exclude_prefixes = [
+        "fault_1s", "fault_5s", "fault_10s", "fault_30s",
+        "fault_mechanism", "severity", "rul_seconds",
+        "voltage_next_", "timestamp", "run_id", "scenario",
+    ]
+    return [
+        col for col in df.columns
+        if not any(col.startswith(p) for p in exclude_prefixes)
+    ]
+
+def prepare_windowed_data(X: np.ndarray, seq_len: int = SEQ_LEN, stride: int = STRIDE) -> np.ndarray:
+    n_windows = max(0, (len(X) - seq_len) // stride)
+    n_features = X.shape[1]
+    windows = np.zeros((n_windows, seq_len, n_features), dtype=np.float32)
+    for i in range(n_windows):
+        start = i * stride
+        windows[i] = X[start : start + seq_len]
+    return windows
 
 def load_data(device: torch.device):
     """Load and normalize data, holding out a validation set."""

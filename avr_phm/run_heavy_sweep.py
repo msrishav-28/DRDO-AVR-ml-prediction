@@ -35,10 +35,33 @@ except ImportError:
     print("Run: pip install optuna")
     exit(1)
 
-from config import get_device, HORIZONS, SEQ_LEN, STRIDE
-from features.engineer import get_feature_columns
+from config import get_device
+
+# Hardcoded config for independence
+HORIZONS = ["fault_1s", "fault_5s", "fault_10s", "fault_30s"]
+SEQ_LEN = 100
+STRIDE = 1
 from sklearn.metrics import roc_auc_score
 
+def get_feature_columns(df: pd.DataFrame) -> list[str]:
+    exclude_prefixes = [
+        "fault_1s", "fault_5s", "fault_10s", "fault_30s",
+        "fault_mechanism", "severity", "rul_seconds",
+        "voltage_next_", "timestamp", "run_id", "scenario",
+    ]
+    return [
+        col for col in df.columns
+        if not any(col.startswith(p) for p in exclude_prefixes)
+    ]
+
+def prepare_windowed_data(X: np.ndarray, seq_len: int = SEQ_LEN, stride: int = STRIDE) -> np.ndarray:
+    n_windows = max(0, (len(X) - seq_len) // stride)
+    n_features = X.shape[1]
+    windows = np.zeros((n_windows, seq_len, n_features), dtype=np.float32)
+    for i in range(n_windows):
+        start = i * stride
+        windows[i] = X[start : start + seq_len]
+    return windows
 
 warnings.filterwarnings("ignore")
 
@@ -78,9 +101,6 @@ def load_sweep_data(device: torch.device) -> dict[str, Any]:
     train_X = (train_X - feat_mean) / feat_std
     val_X = (val_X - feat_mean) / feat_std
     
-    # Needs windowing function from original suite
-    from experiments.evaluate import prepare_windowed_data
-    
     train_windows = torch.from_numpy(prepare_windowed_data(train_X))
     val_windows = torch.from_numpy(prepare_windowed_data(val_X))
     
@@ -104,7 +124,7 @@ def load_sweep_data(device: torch.device) -> dict[str, Any]:
 
 def objective_pinn(trial: optuna.Trial, data: dict[str, Any], device: torch.device) -> float:
     """Optuna objective function for tuning the PINN."""
-    from models.pinn import AVRPINN, compute_physics_informed_loss
+    from models.pinn import AVRPINN, compute_total_loss, AVRPhysicsResidual
     
     # --- Search Space Definition ---
     lr = trial.suggest_float("lr", 1e-4, 5e-3, log=True)
@@ -140,13 +160,25 @@ def objective_pinn(trial: optuna.Trial, data: dict[str, Any], device: torch.devi
             optimizer.zero_grad()
             out = model(batch_x)
             
+            # Compute physics residuals first
+            residual_calc = AVRPhysicsResidual()
+            b_size, seq, _ = batch_x.shape
+            t_batch = torch.linspace(0, (seq - 1) * 0.1, seq).unsqueeze(0).expand(b_size, -1).to(device)
+            # Simulated indices for demonstration
+            v_idx, i_idx = 0, 1
+            v_pred = batch_x[:, :, v_idx]
+            i_pred = batch_x[:, :, i_idx]
+            residuals = residual_calc.compute_residuals(t_batch, v_pred, i_pred, out["forecast"])
+            
             # Loss fn relies on original definitions, passing weights dynamically
-            loss_dict = compute_physics_informed_loss(out, batch_y, batch_x)
+            loss_dict = compute_total_loss(
+                out, batch_y, residuals,
+                lambda_physics=physics_weight,
+                lambda_data=0.5,
+                lambda_fault=1.0
+            )
             
-            # Simulated weighting application
-            total_loss = loss_dict["fault"] + (physics_weight * loss_dict["physics"]) 
-            
-            total_loss.backward()
+            loss_dict["total"].backward()
             optimizer.step()
             
         # Validation Phase
@@ -182,7 +214,7 @@ def main() -> None:
 
     os.makedirs(SWEEP_DIR, exist_ok=True)
     device = get_device()
-    if device.type != "cuda":
+    if device != "cuda":
         print("WARNING: You are running a heavy sweep on CPU. This will take a VERY long time.")
         
     print(f"Loading data for {args.model} sweep...")

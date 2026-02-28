@@ -126,7 +126,7 @@ class AVRPhysicsResidual(nn.Module):
                 allow_unused=True,
             )[0]
             if dv_dt is not None:
-                residuals[:, 0] = dv_dt.squeeze()
+                residuals[:, 0] = dv_dt.squeeze().mean(dim=-1) if dv_dt.dim() > 1 else dv_dt.squeeze()
 
         # Constraint 2: Excitation dynamics
         # ε₂ = Vf_rate - (1/Te)*(-Ke*Vf + Ka*(Vref - Vt))
@@ -135,13 +135,14 @@ class AVRPhysicsResidual(nn.Module):
         excitation_residual: torch.Tensor = (
             (1.0 / self.te) * (-self.ke * vf_implied + self.ka * (self.vref - vt_pu))
         )
-        residuals[:, 1] = excitation_residual
+        residuals[:, 1] = excitation_residual.mean(dim=-1) if excitation_residual.dim() > 1 else excitation_residual
 
         # Constraint 3: Power conservation
         # P_pred = V * I should equal observed power
         p_pred: torch.Tensor = v_pred * i_pred
         p_expected: torch.Tensor = v_pred * i_pred  # Self-consistent
-        residuals[:, 2] = p_pred - p_expected
+        p_res = p_pred - p_expected
+        residuals[:, 2] = p_res.mean(dim=-1) if p_res.dim() > 1 else p_res
 
         return residuals
 
@@ -353,7 +354,12 @@ def focal_loss(
     Mathematical basis:
         FL(p_t) = -α_t * (1 - p_t)^γ * log(p_t)
         where p_t = p if y=1, (1-p) if y=0
+
+    Raises:
+        ValueError if logit dimensions don't match targets.
     """
+    logits = logits.squeeze(-1)
+    
     bce: torch.Tensor = F.binary_cross_entropy_with_logits(
         logits, targets, reduction="none"
     )
