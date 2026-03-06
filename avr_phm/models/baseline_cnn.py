@@ -104,6 +104,16 @@ class AVRCNN(nn.Module):
         return outputs
 
 
+def _focal_loss(proba: torch.Tensor, targets: torch.Tensor,
+                gamma: float = 2.0) -> torch.Tensor:
+    """Focal loss for binary classification (expects probabilities from CNN)."""
+    proba = proba.squeeze(-1).clamp(1e-7, 1 - 1e-7)
+    bce = F.binary_cross_entropy(proba, targets, reduction="none")
+    p_t = proba * targets + (1 - proba) * (1 - targets)
+    focal_weight = (1 - p_t) ** gamma
+    return (focal_weight * bce).mean()
+
+
 def compute_cnn_loss(
     predictions: dict[str, torch.Tensor],
     targets: dict[str, torch.Tensor],
@@ -113,7 +123,6 @@ def compute_cnn_loss(
     Compute the standard data-driven loss for the CNN baseline.
     Identical to the PINN loss but WITHOUT the physics residual component.
     """
-    from models.baseline_lstm import focal_loss  # Reuse existing FL logic
     if fault_weights is None:
         fault_weights = {
             "fault_1s": 3.0,
@@ -126,7 +135,7 @@ def compute_cnn_loss(
     l_fault: torch.Tensor = torch.tensor(0.0, device=next(iter(predictions.values())).device)
     for horizon, weight in fault_weights.items():
         if horizon in predictions and horizon in targets:
-            l_fault = l_fault + weight * focal_loss(
+            l_fault = l_fault + weight * _focal_loss(
                 predictions[horizon], targets[horizon]
             )
 

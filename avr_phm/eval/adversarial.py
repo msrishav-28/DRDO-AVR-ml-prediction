@@ -174,7 +174,7 @@ def evaluate_adversarial_robustness(
     with torch.no_grad():
         clean_out: dict[str, torch.Tensor] = model(x)
         clean_pred: np.ndarray = (
-            clean_out[task_name].cpu().numpy() > 0.5
+            clean_out[task_name].cpu().numpy() > 0.0
         ).astype(int).flatten()
     y_np: np.ndarray = y.cpu().numpy().flatten()
 
@@ -189,7 +189,7 @@ def evaluate_adversarial_robustness(
     with torch.no_grad():
         fgsm_out: dict[str, torch.Tensor] = model(x_fgsm)
         fgsm_pred: np.ndarray = (
-            fgsm_out[task_name].cpu().numpy() > 0.5
+            fgsm_out[task_name].cpu().numpy() > 0.0
         ).astype(int).flatten()
 
     fgsm_f1: float = float(
@@ -203,7 +203,7 @@ def evaluate_adversarial_robustness(
     with torch.no_grad():
         pgd_out: dict[str, torch.Tensor] = model(x_pgd)
         pgd_pred: np.ndarray = (
-            pgd_out[task_name].cpu().numpy() > 0.5
+            pgd_out[task_name].cpu().numpy() > 0.0
         ).astype(int).flatten()
 
     pgd_f1: float = float(

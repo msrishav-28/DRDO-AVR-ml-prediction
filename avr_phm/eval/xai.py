@@ -70,12 +70,12 @@ def compute_shap_explanations(
         X_explain, dtype=torch.float32, device=device
     )
 
-    # Wrapper to extract specific task output
+    # Wrapper to extract specific task output — Bug 24 fix: apply sigmoid for probability-space SHAP
     def _model_wrapper(x: torch.Tensor) -> torch.Tensor:
         outputs: dict[str, torch.Tensor] = model(x)
         if task_name in outputs:
-            return outputs[task_name]
-        return outputs.get("forecast", torch.zeros(x.shape[0], 1))
+            return torch.sigmoid(outputs[task_name])
+        return torch.sigmoid(outputs.get("forecast", torch.zeros(x.shape[0], 1)))
 
     try:
         explainer: shap.GradientExplainer = shap.GradientExplainer(

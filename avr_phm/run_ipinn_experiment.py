@@ -24,7 +24,7 @@ from config import get_device
 # Hardcoded config for independence
 HORIZONS = ["fault_1s", "fault_5s", "fault_10s", "fault_30s"]
 SEQ_LEN = 100
-STRIDE = 1
+STRIDE = 10  # Match run_publication.py; STRIDE=1 causes OOM on 4GB GPU
 from models.pinn import AVRPINN, compute_total_loss, AVRPhysicsResidual
 from models.tier_1_concepts import AdaptiveWeightedPINN
 
@@ -126,16 +126,20 @@ def train_ipinn():
             optimizer.zero_grad()
             out = model(batch_x)
             
-            # Compute physics residuals first
+            # Bug 34 fix: use model forecast output (has grad) instead of input features
             residual_calc = AVRPhysicsResidual()
             b_size, seq, _ = batch_x.shape
             t_batch = torch.linspace(0, (seq - 1) * 0.1, seq).unsqueeze(0).expand(b_size, -1).to(device)
-            v_idx, i_idx = 0, 1
-            v_pred = batch_x[:, :, v_idx]
-            i_pred = batch_x[:, :, i_idx]
-            # Mock forecast tensor if not available
-            forecast = out.get("forecast", torch.zeros_like(v_pred))
-            residuals = residual_calc.compute_residuals(t_batch, v_pred, i_pred, forecast)
+            
+            forecast = out.get("forecast", None)
+            if forecast is not None and forecast.requires_grad:
+                # Use forecast output for physics residual (has gradient flow)
+                v_forecast = forecast[:, :seq] if forecast.shape[-1] >= seq else batch_x[:, :, 0]
+                i_forecast = batch_x[:, :, 1]  # current from input (no forecast head for current)
+                residuals = residual_calc.compute_residuals(t_batch, v_forecast, i_forecast, forecast)
+            else:
+                # Fallback: skip physics loss if forecast head not suitable
+                residuals = torch.zeros(b_size, 3, device=device)
             
             # Extract the raw scalar losses
             loss_dict = compute_total_loss(out, batch_y, residuals, fault_weights={"fault_1s": 1.0, "fault_5s": 1.0, "fault_10s": 1.0, "fault_30s": 1.0})

@@ -353,11 +353,64 @@ def simulate_scenario(
                         dv_shock[:n_apply]
                     )
 
+    # ─── Bug 38 fix: Apply scenario-specific physics from YAML params ──────
+    # EMP post-recovery oscillation
+    if scenario_name == "emp_simulation" and "emp_recovery_oscillation_std" in scenario_params:
+        osc_std: float = scenario_params["emp_recovery_oscillation_std"]
+        for event in transient_events:
+            if event["type"] == "spike":
+                emp_time: float = event["start_s"]
+                osc_duration: float = 5.0  # 5s damped oscillation
+                tau_damp: float = 1.0  # 1s damping time constant
+                omega_osc: float = 2.0 * np.pi * 2.0  # 2 Hz
+                for idx in range(len(avr_df)):
+                    t_val: float = float(avr_df["timestamp"].iloc[idx])
+                    if emp_time <= t_val < emp_time + osc_duration:
+                        dt_emp: float = t_val - emp_time
+                        dv_osc: float = osc_std * np.exp(-dt_emp / tau_damp) * np.sin(omega_osc * dt_emp)
+                        avr_df.iloc[idx, avr_df.columns.get_loc("voltage_v")] += dv_osc
+
+    # Weapons active load step (voltage sag)
+    if scenario_name == "weapons_active" and "load_step_amps" in scenario_params:
+        load_step_a: float = scenario_params["load_step_amps"]
+        r_source: float = 0.05  # Ω typical source impedance
+        dv_load_step: float = -load_step_a * r_source
+        for event in transient_events:
+            if event["type"] == "load_dump":
+                ld_time: float = event["start_s"]
+                ld_duration: float = 2.0  # load step lasts ~2s
+                mask = (avr_df["timestamp"] >= ld_time) & (avr_df["timestamp"] < ld_time + ld_duration)
+                avr_df.loc[mask, "voltage_v"] += dv_load_step
+
+    # ─── Bug 25 fix: Clamp voltage to physical operating envelope ──────────
+    # MIL-STD-1275E: -0.5V (reverse protection diode) to 100V (surge limit)
+    avr_df["voltage_v"] = np.clip(avr_df["voltage_v"].values, -0.5, 100.0)
+
     # ─── Save final outputs ──────────────────────────────────────────────────
     if save_path is not None:
         avr_df.to_csv(save_path, index=False)
         fault_path: str = save_path.replace("avr_data_", "fault_log_")
         fault_df.to_csv(fault_path, index=False)
+
+    # ─── Bug 36 fix: Run validator on outputs ────────────────────────────────
+    import warnings
+    from simulator.validator import validate_timeseries, validate_fault_log
+
+    ts_result = validate_timeseries(avr_df, strict=False)
+    if not ts_result.all_passed:
+        warnings.warn(
+            f"[VALIDATOR] Scenario '{scenario_name}' run {run_id} failed "
+            f"{ts_result.failed}/{ts_result.passed + ts_result.failed} checks:\n"
+            f"{ts_result.summary()}",
+            RuntimeWarning, stacklevel=2,
+        )
+
+    fl_result = validate_fault_log(fault_df)
+    if not fl_result.all_passed:
+        warnings.warn(
+            f"[VALIDATOR] Fault log check failed:\n{fl_result.summary()}",
+            RuntimeWarning, stacklevel=2,
+        )
 
     return avr_df, fault_df
 

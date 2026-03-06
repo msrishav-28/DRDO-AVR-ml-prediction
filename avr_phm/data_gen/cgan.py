@@ -711,8 +711,16 @@ if __name__ == "__main__":
             df: pd.DataFrame = pd.read_csv(csv_path)
             # Extract scenario and determine condition
             scenario_name: str = df["scenario"].iloc[0] if "scenario" in df.columns else "baseline"
-            # Use "none"/"healthy" as default condition (no fault info in windows)
-            cond: np.ndarray = encode_condition(scenario_name, "none", "healthy")
+
+            # Bug 21 fix: load fault log to get actual labels per window
+            fault_log_path: str = csv_path.replace("avr_data_", "fault_log_")
+            fault_log_df: pd.DataFrame | None = None
+            if os.path.exists(fault_log_path):
+                fault_log_df = pd.read_csv(fault_log_path)
+                if "is_operational_transient" in fault_log_df.columns:
+                    fault_log_df = fault_log_df[
+                        fault_log_df["is_operational_transient"] != True  # noqa: E712
+                    ]
 
             # Extract V, I, T columns and create sliding windows
             cols: list[str] = ["voltage_v", "current_a", "temperature_c"]
@@ -721,6 +729,7 @@ if __name__ == "__main__":
                 continue
 
             data: np.ndarray = df[cols].values.astype(np.float32)
+            timestamps: np.ndarray = df["timestamp"].values if "timestamp" in df.columns else np.arange(len(df)) * 0.1
             # Normalize per-channel
             for ch in range(data.shape[1]):
                 ch_std: float = float(np.std(data[:, ch]))
@@ -734,6 +743,28 @@ if __name__ == "__main__":
                 window: np.ndarray = data[start:start + seq_len]
                 if len(window) == seq_len:
                     all_windows.append(window)
+                    # Determine condition from fault log at window end
+                    window_end_time: float = float(timestamps[start + seq_len - 1])
+                    mechanism: str = "none"
+                    severity_cat: str = "healthy"
+                    if fault_log_df is not None and len(fault_log_df) > 0:
+                        # Find faults within this window's time range
+                        window_start_time: float = float(timestamps[start])
+                        window_faults = fault_log_df[
+                            (fault_log_df["timestamp"] >= window_start_time)
+                            & (fault_log_df["timestamp"] <= window_end_time)
+                        ]
+                        if len(window_faults) > 0:
+                            last_fault = window_faults.iloc[-1]
+                            mechanism = str(last_fault.get("fault_mechanism", "none"))
+                            sev_val: float = float(last_fault.get("severity", 0.0))
+                            severity_cat = (
+                                "healthy" if mechanism == "none" or sev_val == 0.0
+                                else "incipient" if sev_val < 0.33
+                                else "developing" if sev_val < 0.66
+                                else "critical"
+                            )
+                    cond = encode_condition(scenario_name, mechanism, severity_cat)
                     all_conds.append(cond)
 
             print(f"  [OK] {os.path.basename(csv_path)}: {n_windows} windows")

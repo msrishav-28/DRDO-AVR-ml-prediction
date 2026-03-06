@@ -208,6 +208,17 @@ def compute_propensity_score(
         max_iter=1000, random_state=42
     )
 
+    # Bug 16 fix: use MLP discriminator for nonlinear real/synthetic boundary
+    from sklearn.neural_network import MLPClassifier
+    clf_mlp: MLPClassifier = MLPClassifier(
+        hidden_layer_sizes=(256, 64),
+        activation="relu",
+        max_iter=500,
+        random_state=42,
+        early_stopping=True,
+        validation_fraction=0.2,
+    )
+
     from sklearn.model_selection import StratifiedKFold
 
     skf: StratifiedKFold = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
@@ -215,8 +226,8 @@ def compute_propensity_score(
     proba: np.ndarray = np.zeros(len(y))
 
     for train_idx, val_idx in skf.split(X, y):
-        clf.fit(X[train_idx], y[train_idx])
-        fold_proba: np.ndarray = clf.predict_proba(X[val_idx])[:, 1]
+        clf_mlp.fit(X[train_idx], y[train_idx])
+        fold_proba: np.ndarray = clf_mlp.predict_proba(X[val_idx])[:, 1]
         proba[val_idx] = fold_proba
         fold_aucs.append(float(roc_auc_score(y[val_idx], fold_proba)))
 
@@ -410,13 +421,13 @@ def run_full_vva(
         real_sequences, synthetic_sequences
     )
 
-    # Check acceptance criteria
-    mmd_sigma1: float = results["mmd"].get("mmd_sigma_1.0", 1.0)
+    # Check acceptance criteria — Bug 23 fix: use median-heuristic MMD
+    mmd_median: float = results["mmd"].get("mmd_median_heuristic", results["mmd"].get("mmd_sigma_1.0", 1.0))
     auc: float = results["propensity"]["auc_mean"]
     acf_min: float = results["acf"]["acf_min_correlation"]
 
     results["acceptance"] = {
-        "mmd_pass": mmd_sigma1 < 0.05,
+        "mmd_pass": mmd_median < 0.05,
         "propensity_pass": auc < 0.65,
         "propensity_critical": auc > 0.75,
         "acf_pass": acf_min > 0.95,

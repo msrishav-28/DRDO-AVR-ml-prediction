@@ -40,7 +40,7 @@ from config import get_device
 # Hardcoded config for independence
 HORIZONS = ["fault_1s", "fault_5s", "fault_10s", "fault_30s"]
 SEQ_LEN = 100
-STRIDE = 1
+STRIDE = 10  # Match run_publication.py; STRIDE=1 causes OOM on 4GB GPU
 from sklearn.metrics import roc_auc_score
 
 def get_feature_columns(df: pd.DataFrame) -> list[str]:
@@ -160,15 +160,18 @@ def objective_pinn(trial: optuna.Trial, data: dict[str, Any], device: torch.devi
             optimizer.zero_grad()
             out = model(batch_x)
             
-            # Compute physics residuals first
+            # Bug 34 fix: use model forecast output instead of input features
             residual_calc = AVRPhysicsResidual()
             b_size, seq, _ = batch_x.shape
             t_batch = torch.linspace(0, (seq - 1) * 0.1, seq).unsqueeze(0).expand(b_size, -1).to(device)
-            # Simulated indices for demonstration
-            v_idx, i_idx = 0, 1
-            v_pred = batch_x[:, :, v_idx]
-            i_pred = batch_x[:, :, i_idx]
-            residuals = residual_calc.compute_residuals(t_batch, v_pred, i_pred, out["forecast"])
+            
+            forecast = out.get("forecast", None)
+            if forecast is not None and forecast.requires_grad:
+                v_forecast = forecast[:, :seq] if forecast.shape[-1] >= seq else batch_x[:, :, 0]
+                i_forecast = batch_x[:, :, 1]
+                residuals = residual_calc.compute_residuals(t_batch, v_forecast, i_forecast, forecast)
+            else:
+                residuals = torch.zeros(b_size, 3, device=device)
             
             # Loss fn relies on original definitions, passing weights dynamically
             loss_dict = compute_total_loss(
@@ -188,7 +191,8 @@ def objective_pinn(trial: optuna.Trial, data: dict[str, Any], device: torch.devi
             for vs in range(0, len(val_x), 512):
                 ve = min(vs + 512, len(val_x))
                 out = model(val_x[vs:ve].to(device))
-                preds_list.append(out[target_horizon].squeeze(-1).cpu())
+                # Bug 04 fix: apply sigmoid (model outputs logits)
+                preds_list.append(torch.sigmoid(out[target_horizon].squeeze(-1)).cpu())
                 
         preds = torch.cat(preds_list).numpy()
         targets = val_y[target_horizon].cpu().numpy()
@@ -232,6 +236,12 @@ def main() -> None:
     print(f"\n[SWEEP START] {args.trials} trials on {device}")
     
     objective = objective_pinn # Defaulting to PINN for this example template
+    if args.model == "transformer":
+        raise NotImplementedError(
+            "--model transformer is not yet implemented. "
+            "Add objective_transformer() before using this flag. "
+            "Aborting to prevent mis-labeled sweep results."
+        )
     
     study.optimize(lambda trial: objective(trial, data, device), n_trials=args.trials, show_progress_bar=True)
     

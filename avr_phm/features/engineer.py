@@ -425,8 +425,11 @@ def engineer_all_features(
     result = compute_targets(result, fault_log_df)
 
     # Step 6: Clean up NaNs from lags and rolling
-    result = result.bfill()
-    result = result.ffill()
+    # Bug 05 fix: only bfill/ffill feature columns, NOT fault label columns
+    label_cols = [c for c in result.columns if c.startswith(("fault_", "severity", "rul_seconds", "fault_mechanism"))]
+    feature_only_cols = [c for c in result.columns if c not in label_cols]
+    result[feature_only_cols] = result[feature_only_cols].bfill()
+    result[feature_only_cols] = result[feature_only_cols].ffill()
     result = result.fillna(0.0)
 
     return result

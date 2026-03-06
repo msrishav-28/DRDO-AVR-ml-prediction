@@ -229,10 +229,10 @@ def compute_lead_time_distribution(
         # Look backward for first prediction=1
         for j in range(fault_idx, -1, -1):
             if y_pred[j] == 0:
-                if j + 1 < fault_idx:
-                    lead_time: float = float(
+                if j + 1 <= fault_idx:
+                    lead_time: float = max(0.0, float(
                         timestamps[fault_idx] - timestamps[j + 1]
-                    )
+                    ))
                     lead_times.append(lead_time)
                 break
 

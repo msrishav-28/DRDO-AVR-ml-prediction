@@ -90,59 +90,56 @@ class AVRPhysicsResidual(nn.Module):
         model_outputs: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute physics residuals using autograd.
+        Compute physics residuals using PyTorch finite-difference (autograd-compatible).
 
-        Purpose:
-            Measures how well the model's predictions obey the known
-            physical laws of the AVR system.
+        Bug 10 fix: replaced scipy ODE with native PyTorch operations.
+        Bug 02 fix: replaced tautological power constraint with power balance.
 
         Inputs:
-            t: Time tensor of shape (batch,) — requires grad.
-            v_pred: Predicted voltage (batch,).
-            i_pred: Predicted current (batch,).
+            t: Time tensor of shape (batch, seq_len).
+            v_pred: Voltage sequence (batch, seq_len).
+            i_pred: Current sequence (batch, seq_len).
             model_outputs: Full model output tensor for additional states.
 
         Outputs:
             Residual tensor of shape (batch, 3).
-
-        Mathematical basis:
-            ε₁: voltage dynamics residual
-            ε₂: excitation dynamics residual
-            ε₃: power conservation residual
         """
         batch_size: int = v_pred.shape[0]
-        residuals: torch.Tensor = torch.zeros(
-            batch_size, 3, device=v_pred.device
-        )
 
-        # Constraint 1: Voltage dynamics
-        # dV/dt should be consistent with AVR dynamics
-        if t.requires_grad:
-            dv_dt: torch.Tensor = torch.autograd.grad(
-                outputs=v_pred.sum(),
-                inputs=t,
-                create_graph=True,
-                retain_graph=True,
-                allow_unused=True,
-            )[0]
-            if dv_dt is not None:
-                residuals[:, 0] = dv_dt.squeeze().mean(dim=-1) if dv_dt.dim() > 1 else dv_dt.squeeze()
+        # Handle 1D inputs (single timestep) — return zeros
+        if v_pred.dim() == 1 or v_pred.shape[-1] < 2:
+            return torch.zeros(batch_size, 3, device=v_pred.device)
+
+        # Constraint 1: Voltage dynamics via finite-difference
+        # dV/dt ≈ (I - V/R_load) / C  where R_load = V_base / I_rated
+        dt = (t[:, 1:] - t[:, :-1]).clamp(min=1e-6)
+        dv_dt_numerical = (v_pred[:, 1:] - v_pred[:, :-1]) / dt
+        v_mid = 0.5 * (v_pred[:, 1:] + v_pred[:, :-1])
+        i_mid = 0.5 * (i_pred[:, 1:] + i_pred[:, :-1])
+        R_load = self.v_base / 10.0  # nominal load resistance
+        C_eff = 0.01  # effective capacitance
+        dv_dt_model = (i_mid - v_mid / R_load) / C_eff
+        constraint_1 = (dv_dt_numerical - dv_dt_model).pow(2).mean()
 
         # Constraint 2: Excitation dynamics
-        # ε₂ = Vf_rate - (1/Te)*(-Ke*Vf + Ka*(Vref - Vt))
-        vt_pu: torch.Tensor = v_pred / self.v_base
-        vf_implied: torch.Tensor = vt_pu * self.ke
-        excitation_residual: torch.Tensor = (
+        vt_pu = v_mid / self.v_base
+        vf_implied = vt_pu * self.ke
+        excitation_residual = (
             (1.0 / self.te) * (-self.ke * vf_implied + self.ka * (self.vref - vt_pu))
         )
-        residuals[:, 1] = excitation_residual.mean(dim=-1) if excitation_residual.dim() > 1 else excitation_residual
+        constraint_2 = excitation_residual.pow(2).mean()
 
-        # Constraint 3: Power conservation
-        # P_pred = V * I should equal observed power
-        p_pred: torch.Tensor = v_pred * i_pred
-        p_expected: torch.Tensor = v_pred * i_pred  # Self-consistent
-        p_res = p_pred - p_expected
-        residuals[:, 2] = p_res.mean(dim=-1) if p_res.dim() > 1 else p_res
+        # Constraint 3: Power balance (Bug 02 fix — replaces tautological P=V*I check)
+        # P_load ≈ V * I should be consistent with P_rated + thermal losses
+        P_load = v_mid * i_mid
+        P_rated = self.v_base * 10.0  # nominal power
+        thermal_loss = 0.001 * (v_mid - self.v_base).pow(2)
+        constraint_3 = (P_load - P_rated - thermal_loss).pow(2).mean()
+
+        residuals = torch.zeros(batch_size, 3, device=v_pred.device)
+        residuals[:, 0] = constraint_1
+        residuals[:, 1] = constraint_2
+        residuals[:, 2] = constraint_3
 
         return residuals
 
@@ -269,12 +266,12 @@ class AVRPINN(nn.Module):
         # Shared representation
         shared: torch.Tensor = self.shared(encoded)
 
-        # Task outputs
+        # Task outputs — Bug 04 fix: output raw logits, sigmoid applied in loss/inference
         outputs: dict[str, torch.Tensor] = {
-            "fault_1s": torch.sigmoid(self.head_fault_1s(shared)),
-            "fault_5s": torch.sigmoid(self.head_fault_5s(shared)),
-            "fault_10s": torch.sigmoid(self.head_fault_10s(shared)),
-            "fault_30s": torch.sigmoid(self.head_fault_30s(shared)),
+            "fault_1s": self.head_fault_1s(shared),
+            "fault_5s": self.head_fault_5s(shared),
+            "fault_10s": self.head_fault_10s(shared),
+            "fault_30s": self.head_fault_30s(shared),
             "mechanism": self.head_mechanism(shared),
             "forecast": self.head_forecast(shared),
             "severity": self.head_severity(shared),
@@ -454,8 +451,12 @@ def compute_total_loss(
     if "forecast" in predictions and "forecast" in targets:
         l_data = F.mse_loss(predictions["forecast"], targets["forecast"])
 
-    # ─── Physics Loss ─────────────────────────────────────────────────────
-    l_physics: torch.Tensor = (physics_residuals**2).mean()
+    # ─── Physics Loss (Bug 11 fix: normalize to O(1)) ──────────────────
+    # Characteristic scale: 28V / 0.1s = 280 V/s → residuals in (V/s)²
+    V_SCALE = 28.0
+    DT_SCALE = 0.1
+    residual_normalised = physics_residuals / (V_SCALE / DT_SCALE + 1e-8)
+    l_physics: torch.Tensor = residual_normalised.pow(2).mean()
 
     # ─── Fault Loss (weighted focal loss) ────────────────────────────────
     l_fault: torch.Tensor = torch.tensor(0.0, device=physics_residuals.device)

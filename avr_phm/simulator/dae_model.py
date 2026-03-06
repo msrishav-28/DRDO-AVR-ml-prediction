@@ -409,11 +409,34 @@ def simulate_avr_mission(
         )
 
         if not sol.success:
-            # If solver fails, use last known state and fill
+            # Bug 17 fix: hold last known good state instead of leaving zeros
+            import warnings
+            warnings.warn(
+                f"DAE solver failed at t={t_start:.3f}s: {sol.message}. "
+                f"Holding previous state.", RuntimeWarning, stacklevel=2
+            )
             n_fill: int = len(chunk_t_eval)
             for fi in range(n_fill):
                 if output_idx + fi < len(t_output):
                     state_history[output_idx + fi] = current_x
+                    # Recompute voltage/current from held state
+                    r_l, x_l = _r_load_func(chunk_t_eval[fi])
+                    z_sq_local: float = r_l**2 + x_l**2
+                    ed_dp: float = current_x[IDX_ED_DPRIME]
+                    eq_dp: float = current_x[IDX_EQ_DPRIME]
+                    vd_local: float = ed_dp
+                    vq_local: float = eq_dp
+                    for _ in range(3):
+                        id_l: float = (vd_local * r_l + vq_local * x_l) / z_sq_local
+                        iq_l: float = (vq_local * r_l - vd_local * x_l) / z_sq_local
+                        vd_local = -Ra * id_l - Xq_dprime * iq_l + ed_dp
+                        vq_local = -Ra * iq_l + Xd_dprime * id_l + eq_dp
+                    vt_pu: float = np.sqrt(vd_local**2 + vq_local**2)
+                    vt_history[output_idx + fi] = vt_pu * V_base
+                    id_l = (vd_local * r_l + vq_local * x_l) / z_sq_local
+                    iq_l = (vq_local * r_l - vd_local * x_l) / z_sq_local
+                    i_pu: float = np.sqrt(id_l**2 + iq_l**2)
+                    current_history[output_idx + fi] = i_pu * I_base
             output_idx += n_fill
             continue
 
@@ -477,8 +500,17 @@ def simulate_avr_mission(
         ramp_rate: float = scenario_params["temp_ramp_c_per_hour"]
         temperature_c += ramp_rate * t_output[:output_idx] / 3600.0
 
-    # ─── Build output DataFrames ─────────────────────────────────────────────
+    # Bug 18 fix: Apply measurement noise to stored outputs
     n_actual: int = min(output_idx, len(t_output))
+    rng_noise: np.random.Generator = np.random.default_rng(42)
+    sigma_v: float = SIGMA_SENSOR_NOMINAL  # voltage noise std (V)
+    sigma_i: float = SIGMA_SENSOR_NOMINAL * (I_base / V_base)  # scale to current
+    sigma_t: float = 0.5  # 0.5°C temperature sensor noise
+    vt_history[:n_actual] += rng_noise.normal(0.0, sigma_v, n_actual)
+    current_history[:n_actual] += rng_noise.normal(0.0, sigma_i, n_actual)
+    temperature_c[:n_actual] += rng_noise.normal(0.0, sigma_t, n_actual)
+
+    # ─── Build output DataFrames ─────────────────────────────────────────────
     avr_timeseries_df: pd.DataFrame = pd.DataFrame({
         "timestamp": t_output[:n_actual],
         "voltage_v": vt_history[:n_actual],

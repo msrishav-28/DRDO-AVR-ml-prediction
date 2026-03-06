@@ -54,29 +54,39 @@ from sklearn.metrics import (
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# ─── Configuration ────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# PIPELINE CONSTANTS — Single source of truth
+# ═══════════════════════════════════════════════════════════════════════════
 
-SEEDS: list[int] = [42, 123, 456, 789, 2026]
-MAX_EPOCHS: int = 200
-PATIENCE: int = 30
+# ── Data configuration ────────────────────────────────────────────────────
 SEQ_LEN: int = 100
 STRIDE: int = 10
 HORIZONS: list[str] = ["fault_1s", "fault_5s", "fault_10s", "fault_30s"]
 
-# Paths (relative to avr_phm/)
+# ── Hardware profile: Ryzen 7 5800H + RTX 3050 4 GB + 16 GB DDR4 ─────────
+PINN_BATCH_SIZE: int = 256
+VAL_CHUNK_SIZE: int = 256
+RF_NJOBS: int = -1
+
+# ── Seed configuration ────────────────────────────────────────────────────
+SEEDS: list[int] = [42, 123, 456, 789, 2026]
+
+# ── Training loop configuration ───────────────────────────────────────────
+MAX_EPOCHS: int = 200
+PINN_LR_INIT: float = 1e-3
+PINN_LR_MIN: float = 1e-6
+PINN_LR_TMAX: int = 200
+EARLY_STOP_PATIENCE: int = 20
+EARLY_STOP_DELTA: float = 1e-4
+GRAD_CLIP_MAX_NORM: float = 1.0
+PRIMARY_HORIZON: str = "fault_10s"
+
+# ── Paths (relative to avr_phm/) ─────────────────────────────────────────
 DATA_DIR: str = "data/raw"
 FEATURED_DIR: str = "data/featured"
 RESULTS_DIR: str = "outputs/results"
 CHECKPOINT_DIR: str = "outputs/checkpoints"
 FIGURES_DIR: str = "outputs/figures"
-
-# ─── Hardware-aware batch sizes ───────────────────────────────────────
-# RTX 3050 4GB: PINN (122K params) + batch of windows fits easily.
-# Each window = (100, 94) × 4 bytes = 37.6 KB
-# Batch of 128 = ~4.8 MB → GPU memory is not the bottleneck.
-PINN_BATCH_SIZE: int = 128
-# RF on CPU: n_jobs=-1 uses all 16 threads of Ryzen 5800H
-RF_NJOBS: int = -1
 
 
 def pick_device() -> torch.device:
@@ -150,6 +160,114 @@ def prepare_windowed_data(
     return windows
 
 
+def get_window_target_indices(n_rows: int, seq_len: int, stride: int) -> np.ndarray:
+    """Return the label row index for each sliding window (Bug 09 fix).
+
+    Window i spans rows [i*stride : i*stride + seq_len].
+    The label for window i is at the last row: i*stride + seq_len - 1.
+    """
+    n_windows = max(0, (n_rows - seq_len) // stride)
+    return np.array([i * stride + seq_len - 1 for i in range(n_windows)], dtype=np.int64)
+
+
+# ─── Early Stopping (AUROC-based) ────────────────────────────────────────────
+
+class EarlyStopping:
+    """Early stopping based on validation AUROC (higher is better).
+
+    Monitors val_auroc on PRIMARY_HORIZON. Saves the best model checkpoint
+    whenever val_auroc improves by more than delta. Signals stop after
+    patience consecutive epochs without sufficient improvement.
+    """
+
+    def __init__(
+        self,
+        patience: int,
+        delta: float,
+        checkpoint_path: str,
+        verbose: bool = True,
+    ) -> None:
+        self.patience = patience
+        self.delta = delta
+        self.checkpoint_path = checkpoint_path
+        self.verbose = verbose
+
+        self.best_score: float = -float("inf")
+        self.counter: int = 0
+        self.should_stop: bool = False
+        self.best_epoch: int = 0
+
+    def step(self, val_auroc: float, model: torch.nn.Module, epoch: int) -> None:
+        """Call once per epoch. Saves checkpoint if improved, increments counter otherwise."""
+        improvement = val_auroc - self.best_score
+
+        if improvement > self.delta:
+            self.best_score = val_auroc
+            self.counter = 0
+            self.best_epoch = epoch
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "val_auroc": val_auroc,
+            }, self.checkpoint_path)
+            if self.verbose and (epoch + 1) % 20 == 0:
+                print(f"    [ES] New best val_auroc={val_auroc:.6f} at epoch {epoch+1}")
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.should_stop = True
+                if self.verbose:
+                    print(f"    [EARLY STOP] at epoch {epoch+1} "
+                          f"(no improvement for {self.patience} epochs, "
+                          f"best={self.best_score:.6f} at epoch {self.best_epoch+1})")
+
+    def load_best(self, model: torch.nn.Module) -> float:
+        """Load the best saved checkpoint into model. Returns best val_auroc."""
+        if not os.path.exists(self.checkpoint_path):
+            print(f"    [ES] WARNING: No checkpoint at {self.checkpoint_path}")
+            return self.best_score
+        ckpt = torch.load(self.checkpoint_path, map_location="cpu", weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        if self.verbose:
+            print(f"    [ES] Restored best checkpoint: "
+                  f"val_auroc={ckpt['val_auroc']:.6f} (epoch {ckpt['epoch']+1})")
+        return float(ckpt["val_auroc"])
+
+
+def compute_val_auroc(
+    model: torch.nn.Module,
+    val_windows: torch.Tensor,
+    val_targets: torch.Tensor,
+    horizon: str,
+    chunk_size: int = VAL_CHUNK_SIZE,
+) -> float:
+    """Compute validation AUROC for a single horizon without gradients.
+
+    Returns 0.5 if no positive labels or predictions are constant.
+    """
+    from sklearn.metrics import roc_auc_score
+
+    model.eval()
+    preds_list: list[torch.Tensor] = []
+
+    with torch.no_grad():
+        for vs in range(0, len(val_windows), chunk_size):
+            ve = min(vs + chunk_size, len(val_windows))
+            out = model(val_windows[vs:ve])
+            preds_list.append(torch.sigmoid(out[horizon].squeeze(-1)).cpu())
+
+    all_preds = torch.cat(preds_list).numpy()
+    all_targets = val_targets.numpy() if isinstance(val_targets, torch.Tensor) else val_targets
+
+    if all_targets.sum() == 0 or np.std(all_preds) < 1e-8:
+        return 0.5
+
+    try:
+        return float(roc_auc_score(all_targets, all_preds))
+    except ValueError:
+        return 0.5
+
+
 # ─── Section 1: Multi-Seed PINN Training ─────────────────────────────────────
 
 def train_pinn_multiseed(
@@ -188,21 +306,31 @@ def train_pinn_multiseed(
     train_windows = torch.from_numpy(prepare_windowed_data(train_X))
     val_windows = torch.from_numpy(prepare_windowed_data(val_X))
 
-    # Targets: take the label at the *end* of each window
-    train_targets = torch.from_numpy(
-        train_df["fault_10s"].values[SEQ_LEN - 1::STRIDE][:len(train_windows)].astype(np.float32)
-    )
-    val_targets = torch.from_numpy(
-        val_df["fault_10s"].values[SEQ_LEN - 1::STRIDE][:len(val_windows)].astype(np.float32)
-    )
+    # Targets: take the label at the *end* of each window (Bug 09 fix)
+    train_label_indices = get_window_target_indices(len(train_df), SEQ_LEN, STRIDE)
+    val_label_indices = get_window_target_indices(len(val_df), SEQ_LEN, STRIDE)
+
+    # Bug 03 fix: build multi-task target dicts for all 4 horizons
+    train_targets_dict = {
+        h: torch.from_numpy(train_df[h].values[train_label_indices].astype(np.float32))
+        for h in HORIZONS
+    }
+    val_targets_dict = {
+        h: torch.from_numpy(val_df[h].values[val_label_indices].astype(np.float32))
+        for h in HORIZONS
+    }
+    # Reference for class-weight computation
+    train_targets_ref = train_targets_dict["fault_10s"]
 
     print(f"[PINN] {len(train_windows)} train / {len(val_windows)} val windows")
     print(f"[PINN] Input shape: ({SEQ_LEN}, {n_features}), device={device}")
-    print(f"[PINN] Positive rate (train): {train_targets.mean():.4f}")
+    print(f"[PINN] Positive rate (train): {train_targets_ref.mean():.4f}")
 
     # Move validation data to GPU once (fits in 4GB easily)
     val_windows_gpu = val_windows.to(device)
-    val_targets_gpu = val_targets.to(device)
+    # Move all targets to GPU once
+    train_targets_dict_gpu = {h: t.to(device) for h, t in train_targets_dict.items()}
+    val_targets_dict_gpu = {h: t.to(device) for h, t in val_targets_dict.items()}
 
     for seed in SEEDS:
         print(f"\n{'='*60}")
@@ -218,24 +346,31 @@ def train_pinn_multiseed(
         # PINN forward() expects (batch, window_size, n_features)
         # and internally does x.permute(0, 2, 1) for Conv1d.
         model = AVRPINN(n_input_features=n_features).to(device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=MAX_EPOCHS
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=PINN_LR_INIT, weight_decay=1e-4
         )
-        # Use BCELoss since PINN heads already apply sigmoid
-        criterion = nn.BCELoss()
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=PINN_LR_TMAX, eta_min=PINN_LR_MIN,
+        )
 
         # Class-weight for imbalanced data
-        n_pos = train_targets.sum().item()
-        n_neg = len(train_targets) - n_pos
+        n_pos = train_targets_ref.sum().item()
+        n_neg = len(train_targets_ref) - n_pos
         pos_weight = n_neg / max(n_pos, 1.0)
         print(f"  Pos weight: {pos_weight:.1f} (1:{pos_weight:.0f} ratio)")
 
-        best_val_loss = float("inf")
-        patience_counter = 0
+        ckpt_path = os.path.join(CHECKPOINT_DIR, f"pinn_seed{seed}_best.pt")
+        stopper = EarlyStopping(
+            patience=EARLY_STOP_PATIENCE,
+            delta=EARLY_STOP_DELTA,
+            checkpoint_path=ckpt_path,
+        )
         seed_losses: dict[str, list[float]] = {"train": [], "val": []}
 
         t_seed_start = time.time()
+        print(f"  LR: {PINN_LR_INIT} -> {PINN_LR_MIN} (cosine, T_max={PINN_LR_TMAX})")
+        print(f"  Early stop: patience={EARLY_STOP_PATIENCE}, "
+              f"delta={EARLY_STOP_DELTA}, criterion=val_auroc[{PRIMARY_HORIZON}]")
 
         for epoch in range(MAX_EPOCHS):
             model.train()
@@ -249,21 +384,33 @@ def train_pinn_multiseed(
 
                 # Input: (batch, seq_len, n_features) — PINN permutes internally
                 batch_x = train_windows[idx].to(device)
-                batch_y = train_targets[idx].to(device)
 
                 optimizer.zero_grad()
-                output = model(batch_x)  # Returns dict of task outputs
+                output = model(batch_x)
 
-                # Use fault_10s head (primary task)
-                pred = output["fault_10s"].squeeze(-1)
+                # Bug 01+03 fix: use compute_total_loss with all 4 horizons
+                batch_targets = {h: train_targets_dict_gpu[h][idx] for h in HORIZONS}
 
-                # Weighted BCE
-                weight = torch.where(batch_y == 1.0, pos_weight, 1.0)
-                loss = nn.functional.binary_cross_entropy(
-                    pred, batch_y, weight=weight
+                # Bug 10 fix: compute physics residuals using PyTorch finite-difference
+                v_col = feature_cols.index("voltage_v") if "voltage_v" in feature_cols else 0
+                i_col = feature_cols.index("current_a") if "current_a" in feature_cols else 1
+                v_seq = batch_x[:, :, v_col]
+                i_seq = batch_x[:, :, i_col]
+                t_batch = torch.linspace(0, (SEQ_LEN - 1) * 0.1, SEQ_LEN, device=device).unsqueeze(0).expand(batch_x.shape[0], -1)
+                physics_residual = model.physics_residual.compute_residuals(t_batch, v_seq, i_seq, output.get("forecast"))
+
+                from models.pinn import compute_total_loss
+                loss_dict = compute_total_loss(
+                    predictions=output,
+                    targets=batch_targets,
+                    physics_residuals=physics_residual,
+                    lambda_physics=0.1,
+                    lambda_data=0.5,
+                    lambda_fault=1.0,
                 )
+                loss = loss_dict["total"]
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
                 optimizer.step()
 
                 epoch_loss += loss.item()
@@ -273,74 +420,77 @@ def train_pinn_multiseed(
             avg_train = epoch_loss / max(n_batches, 1)
             seed_losses["train"].append(avg_train)
 
-            # ─── Validation ───────────────────────────────────────
+            # ─── Validation (loss + AUROC) ────────────────────────
             model.eval()
             with torch.no_grad():
-                # Process validation in chunks to conserve GPU memory
-                val_preds_list = []
-                val_chunk = 256
-                for vs in range(0, len(val_windows_gpu), val_chunk):
-                    ve = min(vs + val_chunk, len(val_windows_gpu))
+                val_loss_total = 0.0
+                n_val_chunks = 0
+                for vs in range(0, len(val_windows_gpu), VAL_CHUNK_SIZE):
+                    ve = min(vs + VAL_CHUNK_SIZE, len(val_windows_gpu))
                     chunk_out = model(val_windows_gpu[vs:ve])
-                    val_preds_list.append(chunk_out["fault_10s"].squeeze(-1))
-                val_pred = torch.cat(val_preds_list)
-                vt = val_targets_gpu[:len(val_pred)]
-                val_loss = nn.functional.binary_cross_entropy(val_pred, vt).item()
+                    chunk_targets = {h: val_targets_dict_gpu[h][vs:ve] for h in HORIZONS}
+                    dummy_residuals = torch.zeros(ve - vs, 3, device=device)
+                    v_loss = compute_total_loss(
+                        chunk_out, chunk_targets, dummy_residuals,
+                        lambda_physics=0.0, lambda_data=0.5, lambda_fault=1.0,
+                    )["total"]
+                    val_loss_total += v_loss.item()
+                    n_val_chunks += 1
+                val_loss = val_loss_total / max(n_val_chunks, 1)
 
             seed_losses["val"].append(val_loss)
 
-            # ─── Early stopping ───────────────────────────────────
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                patience_counter = 0
-                torch.save({
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "best_val_loss": best_val_loss,
-                    "seed": seed,
-                    "n_features": n_features,
-                }, os.path.join(CHECKPOINT_DIR, f"pinn_seed{seed}_best.pt"))
-            else:
-                patience_counter += 1
+            # ─── AUROC-based early stopping ───────────────────────
+            val_auroc = compute_val_auroc(
+                model=model,
+                val_windows=val_windows_gpu,
+                val_targets=val_targets_dict[PRIMARY_HORIZON],
+                horizon=PRIMARY_HORIZON,
+                chunk_size=VAL_CHUNK_SIZE,
+            )
+
+            stopper.step(val_auroc=val_auroc, model=model, epoch=epoch)
 
             if (epoch + 1) % 20 == 0:
                 lr = scheduler.get_last_lr()[0]
                 elapsed = time.time() - t_seed_start
                 print(
                     f"  [Epoch {epoch+1:3d}/{MAX_EPOCHS}] "
-                    f"train={avg_train:.6f}  val={val_loss:.6f}  "
-                    f"best={best_val_loss:.6f}  lr={lr:.6f}  "
+                    f"train={avg_train:.6f}  val_loss={val_loss:.6f}  "
+                    f"val_auroc={val_auroc:.4f}  lr={lr:.6f}  "
                     f"({elapsed:.0f}s)"
                 )
 
-            if patience_counter >= PATIENCE:
-                print(f"  [EARLY STOP] at epoch {epoch+1} (patience={PATIENCE})")
+            if stopper.should_stop:
                 break
 
+        # Restore best checkpoint
+        best_auroc = stopper.load_best(model)
         elapsed = time.time() - t_seed_start
         results["seeds"][str(seed)] = {
-            "best_val_loss": best_val_loss,
+            "best_val_auroc": best_auroc,
+            "best_epoch": stopper.best_epoch + 1,
             "final_epoch": epoch + 1,
             "time_seconds": round(elapsed, 1),
             "train_losses": seed_losses["train"],
             "val_losses": seed_losses["val"],
         }
-        print(f"  [DONE] Seed {seed}: best_val={best_val_loss:.6f} "
-              f"at epoch {epoch+1} ({elapsed:.0f}s)")
+        print(f"  [DONE] Seed {seed}: best_val_auroc={best_auroc:.6f} "
+              f"at epoch {stopper.best_epoch+1} ({elapsed:.0f}s)")
 
     # ─── Summary statistics ───────────────────────────────────────
-    val_losses = [
-        v["best_val_loss"] for v in results["seeds"].values()
-        if v["best_val_loss"] < float("inf")
+    aurocs = [
+        v["best_val_auroc"] for v in results["seeds"].values()
+        if v["best_val_auroc"] > 0
     ]
-    if val_losses:
+    if aurocs:
         results["summary"] = {
-            "mean_val_loss": round(float(np.mean(val_losses)), 6),
-            "std_val_loss": round(float(np.std(val_losses)), 6),
-            "n_seeds": len(val_losses),
+            "mean_val_auroc": round(float(np.mean(aurocs)), 6),
+            "std_val_auroc": round(float(np.std(aurocs)), 6),
+            "n_seeds": len(aurocs),
         }
-        print(f"\n[PINN SUMMARY] Val loss: {np.mean(val_losses):.6f} "
-              f"± {np.std(val_losses):.6f} ({len(val_losses)} seeds)")
+        print(f"\n[PINN SUMMARY] Val AUROC: {np.mean(aurocs):.6f} "
+              f"± {np.std(aurocs):.6f} ({len(aurocs)} seeds)")
 
     return results
 
@@ -412,16 +562,23 @@ def train_lstm_multiseed(
             torch.cuda.manual_seed_all(seed)
 
         model = AVRLSTM(n_input_features=n_features).to(device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=PINN_LR_INIT, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=MAX_EPOCHS, eta_min=PINN_LR_MIN,
+        )
 
         # Class-weight
         n_pos = train_targets.sum().item()
         n_neg = len(train_targets) - n_pos
         pos_weight = n_neg / max(n_pos, 1.0)
 
-        best_val_loss = float("inf")
-        patience_counter = 0
+        stopper = EarlyStopping(
+            patience=EARLY_STOP_PATIENCE,
+            delta=EARLY_STOP_DELTA,
+            ckpt_path=os.path.join(CHECKPOINT_DIR, f"lstm_seed{seed}_best.pt"),
+            seed=seed,
+            n_features=n_features,
+        )
         seed_losses: dict[str, list[float]] = {"train": [], "val": []}
 
         t_seed_start = time.time()
@@ -446,7 +603,7 @@ def train_lstm_multiseed(
                 loss = losses["total"]
                 
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
                 optimizer.step()
 
                 epoch_loss += loss.item()
@@ -456,14 +613,13 @@ def train_lstm_multiseed(
             avg_train = epoch_loss / max(n_batches, 1)
             seed_losses["train"].append(avg_train)
 
-            # ─── Validation ───────────────────────────────────────
+            # ─── Validation (loss + AUROC) ────────────────────────
             model.eval()
             with torch.no_grad():
-                val_chunk = 256
                 val_loss_total = 0.0
                 n_val_batches = 0
-                for vs in range(0, len(val_windows_gpu), val_chunk):
-                    ve = min(vs + val_chunk, len(val_windows_gpu))
+                for vs in range(0, len(val_windows_gpu), VAL_CHUNK_SIZE):
+                    ve = min(vs + VAL_CHUNK_SIZE, len(val_windows_gpu))
                     chunk_out = model(val_windows_gpu[vs:ve])
                     chunk_targets = {h: t[vs:ve] for h, t in val_targets_dict.items()}
                     v_loss = compute_lstm_loss(chunk_out, chunk_targets)["total"]
@@ -473,58 +629,57 @@ def train_lstm_multiseed(
 
             seed_losses["val"].append(val_loss)
 
-            # ─── Early stopping ───────────────────────────────────
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                patience_counter = 0
-                torch.save({
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "best_val_loss": best_val_loss,
-                    "seed": seed,
-                    "n_features": n_features,
-                }, os.path.join(CHECKPOINT_DIR, f"lstm_seed{seed}_best.pt"))
-            else:
-                patience_counter += 1
+            # ─── AUROC-based early stopping ───────────────────────
+            val_auroc = compute_val_auroc(
+                model=model,
+                val_windows=val_windows_gpu,
+                val_targets=val_targets_dict[PRIMARY_HORIZON],
+                horizon=PRIMARY_HORIZON,
+                chunk_size=VAL_CHUNK_SIZE,
+            )
+
+            stopper.step(val_auroc=val_auroc, model=model, epoch=epoch)
 
             if (epoch + 1) % 20 == 0:
                 lr = scheduler.get_last_lr()[0]
                 elapsed = time.time() - t_seed_start
                 print(
                     f"  [Epoch {epoch+1:3d}/{MAX_EPOCHS}] "
-                    f"train={avg_train:.6f}  val={val_loss:.6f}  "
-                    f"best={best_val_loss:.6f}  lr={lr:.6f}  "
+                    f"train={avg_train:.6f}  val_loss={val_loss:.6f}  "
+                    f"val_auroc={val_auroc:.4f}  lr={lr:.6f}  "
                     f"({elapsed:.0f}s)"
                 )
 
-            if patience_counter >= PATIENCE:
-                print(f"  [EARLY STOP] at epoch {epoch+1} (patience={PATIENCE})")
+            if stopper.should_stop:
                 break
 
+        # Restore best checkpoint
+        best_auroc = stopper.load_best(model)
         elapsed = time.time() - t_seed_start
         results["seeds"][str(seed)] = {
-            "best_val_loss": best_val_loss,
+            "best_val_auroc": best_auroc,
+            "best_epoch": stopper.best_epoch + 1,
             "final_epoch": epoch + 1,
             "time_seconds": round(elapsed, 1),
             "train_losses": seed_losses["train"],
             "val_losses": seed_losses["val"],
         }
-        print(f"  [DONE] Seed {seed}: best_val={best_val_loss:.6f} "
-              f"at epoch {epoch+1} ({elapsed:.0f}s)")
+        print(f"  [DONE] Seed {seed}: best_val_auroc={best_auroc:.6f} "
+              f"at epoch {stopper.best_epoch+1} ({elapsed:.0f}s)")
 
     # ─── Summary statistics ───────────────────────────────────────
-    val_losses = [
-        v["best_val_loss"] for v in results["seeds"].values()
-        if v["best_val_loss"] < float("inf")
+    aurocs = [
+        v["best_val_auroc"] for v in results["seeds"].values()
+        if v["best_val_auroc"] > 0
     ]
-    if val_losses:
+    if aurocs:
         results["summary"] = {
-            "mean_val_loss": round(float(np.mean(val_losses)), 6),
-            "std_val_loss": round(float(np.std(val_losses)), 6),
-            "n_seeds": len(val_losses),
+            "mean_val_auroc": round(float(np.mean(aurocs)), 6),
+            "std_val_auroc": round(float(np.std(aurocs)), 6),
+            "n_seeds": len(aurocs),
         }
-        print(f"\n[LSTM SUMMARY] Val loss: {np.mean(val_losses):.6f} "
-              f"± {np.std(val_losses):.6f} ({len(val_losses)} seeds)")
+        print(f"\n[LSTM SUMMARY] Val AUROC: {np.mean(aurocs):.6f} "
+              f"± {np.std(aurocs):.6f} ({len(aurocs)} seeds)")
 
     return results
 
@@ -590,15 +745,22 @@ def train_cnn_multiseed(
             torch.cuda.manual_seed_all(seed)
 
         model = AVRCNN(n_input_features=n_features).to(device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=PINN_LR_INIT, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=MAX_EPOCHS, eta_min=PINN_LR_MIN,
+        )
 
         n_pos = train_targets.sum().item()
         n_neg = len(train_targets) - n_pos
         pos_weight = n_neg / max(n_pos, 1.0)
 
-        best_val_loss = float("inf")
-        patience_counter = 0
+        stopper = EarlyStopping(
+            patience=EARLY_STOP_PATIENCE,
+            delta=EARLY_STOP_DELTA,
+            ckpt_path=os.path.join(CHECKPOINT_DIR, f"cnn_seed{seed}_best.pt"),
+            seed=seed,
+            n_features=n_features,
+        )
         seed_losses: dict[str, list[float]] = {"train": [], "val": []}
 
         t_seed_start = time.time()
@@ -623,7 +785,7 @@ def train_cnn_multiseed(
                 loss = losses["total"]
                 
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
                 optimizer.step()
 
                 epoch_loss += loss.item()
@@ -633,13 +795,13 @@ def train_cnn_multiseed(
             avg_train = epoch_loss / max(n_batches, 1)
             seed_losses["train"].append(avg_train)
 
+            # ─── Validation (loss + AUROC) ────────────────────────
             model.eval()
             with torch.no_grad():
-                val_chunk = 256
                 val_loss_total = 0.0
                 n_val_batches = 0
-                for vs in range(0, len(val_windows_gpu), val_chunk):
-                    ve = min(vs + val_chunk, len(val_windows_gpu))
+                for vs in range(0, len(val_windows_gpu), VAL_CHUNK_SIZE):
+                    ve = min(vs + VAL_CHUNK_SIZE, len(val_windows_gpu))
                     chunk_out = model(val_windows_gpu[vs:ve])
                     chunk_targets = {h: t[vs:ve] for h, t in val_targets_dict.items()}
                     v_loss = compute_cnn_loss(chunk_out, chunk_targets)["total"]
@@ -649,46 +811,52 @@ def train_cnn_multiseed(
 
             seed_losses["val"].append(val_loss)
 
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                patience_counter = 0
-                torch.save({
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "best_val_loss": best_val_loss,
-                    "seed": seed,
-                    "n_features": n_features,
-                }, os.path.join(CHECKPOINT_DIR, f"cnn_seed{seed}_best.pt"))
-            else:
-                patience_counter += 1
+            # ─── AUROC-based early stopping ───────────────────────
+            val_auroc = compute_val_auroc(
+                model=model,
+                val_windows=val_windows_gpu,
+                val_targets=val_targets_dict[PRIMARY_HORIZON],
+                horizon=PRIMARY_HORIZON,
+                chunk_size=VAL_CHUNK_SIZE,
+            )
+
+            stopper.step(val_auroc=val_auroc, model=model, epoch=epoch)
 
             if (epoch + 1) % 20 == 0:
+                lr = scheduler.get_last_lr()[0]
+                elapsed = time.time() - t_seed_start
                 print(
                     f"  [Epoch {epoch+1:3d}/{MAX_EPOCHS}] "
-                    f"train={avg_train:.6f}  val={val_loss:.6f}  "
-                    f"best={best_val_loss:.6f}  lr={scheduler.get_last_lr()[0]:.6f}  "
+                    f"train={avg_train:.6f}  val_loss={val_loss:.6f}  "
+                    f"val_auroc={val_auroc:.4f}  lr={lr:.6f}  "
+                    f"({elapsed:.0f}s)"
                 )
 
-            if patience_counter >= PATIENCE:
-                print(f"  [EARLY STOP] at epoch {epoch+1}")
+            if stopper.should_stop:
                 break
 
+        # Restore best checkpoint
+        best_auroc = stopper.load_best(model)
         elapsed = time.time() - t_seed_start
         results["seeds"][str(seed)] = {
-            "best_val_loss": best_val_loss,
+            "best_val_auroc": best_auroc,
+            "best_epoch": stopper.best_epoch + 1,
             "final_epoch": epoch + 1,
             "time_seconds": round(elapsed, 1),
+            "train_losses": seed_losses["train"],
+            "val_losses": seed_losses["val"],
         }
-        print(f"  [DONE] Seed {seed}: best_val={best_val_loss:.6f}")
+        print(f"  [DONE] Seed {seed}: best_val_auroc={best_auroc:.6f} "
+              f"at epoch {stopper.best_epoch+1} ({elapsed:.0f}s)")
 
-    val_losses = [v["best_val_loss"] for v in results["seeds"].values() if v["best_val_loss"] < float("inf")]
-    if val_losses:
+    aurocs = [v["best_val_auroc"] for v in results["seeds"].values() if v["best_val_auroc"] > 0]
+    if aurocs:
         results["summary"] = {
-            "mean_val_loss": round(float(np.mean(val_losses)), 6),
-            "std_val_loss": round(float(np.std(val_losses)), 6),
-            "n_seeds": len(val_losses),
+            "mean_val_auroc": round(float(np.mean(aurocs)), 6),
+            "std_val_auroc": round(float(np.std(aurocs)), 6),
+            "n_seeds": len(aurocs),
         }
-        print(f"\n[CNN SUMMARY] Val loss: {np.mean(val_losses):.6f} ± {np.std(val_losses):.6f}")
+        print(f"\n[CNN SUMMARY] Val AUROC: {np.mean(aurocs):.6f} ± {np.std(aurocs):.6f}")
 
     return results
 
@@ -820,6 +988,19 @@ def evaluate_all_models(
 
             metrics: dict[str, Any] = {}
 
+            # Bug 27+06 fix: compute test windows ONCE, before all model loops
+            test_X_norm = (test_X_raw - feat_mean) / feat_std
+            test_wins = torch.from_numpy(
+                prepare_windowed_data(test_X_norm)
+            ).to(device)
+            # Bug 09 fix: use explicit window target indices
+            win_indices = get_window_target_indices(len(test_y), SEQ_LEN, STRIDE)
+            test_y_wins = test_y[win_indices]
+
+            # Bug 08 fix: align RF evaluation to same windowed population
+            test_X_aligned = test_X_raw[win_indices]
+            test_y_aligned = test_y_wins
+
             # ─── RF metrics (5 seeds) ────────────────────────────
             rf_aurocs, rf_auprcs, rf_f1s, rf_recall1 = [], [], [], []
             for seed in SEEDS:
@@ -829,23 +1010,23 @@ def evaluate_all_models(
                     min_samples_leaf=5,
                 )
                 rf.fit(train_X, train_y)
-                pred = rf.predict(test_X_raw)
-                proba = rf.predict_proba(test_X_raw)
+                pred = rf.predict(test_X_aligned)
+                proba = rf.predict_proba(test_X_aligned)
                 proba_pos = proba[:, 1] if proba.shape[1] == 2 else proba[:, 0]
 
-                rf_f1s.append(f1_score(test_y, pred, zero_division=0))
+                rf_f1s.append(f1_score(test_y_aligned, pred, zero_division=0))
                 try:
-                    rf_aurocs.append(roc_auc_score(test_y, proba_pos))
+                    rf_aurocs.append(roc_auc_score(test_y_aligned, proba_pos))
                 except ValueError:
                     rf_aurocs.append(0.5)
                 try:
-                    rf_auprcs.append(average_precision_score(test_y, proba_pos))
+                    rf_auprcs.append(average_precision_score(test_y_aligned, proba_pos))
                 except ValueError:
                     rf_auprcs.append(0.0)
 
                 # Recall at 1% FAR
                 try:
-                    fpr, tpr, _ = roc_curve(test_y, proba_pos)
+                    fpr, tpr, _ = roc_curve(test_y_aligned, proba_pos)
                     rf_recall1.append(float(np.interp(0.01, fpr, tpr)))
                 except Exception:
                     rf_recall1.append(0.0)
@@ -869,12 +1050,7 @@ def evaluate_all_models(
                 model.load_state_dict(ckpt["model_state_dict"])
                 model.eval()
 
-                # Normalize test data and window it
-                test_X_norm = (test_X_raw - feat_mean) / feat_std
-                test_wins = torch.from_numpy(
-                    prepare_windowed_data(test_X_norm)
-                ).to(device)
-                test_y_wins = test_y[SEQ_LEN - 1::STRIDE][:len(test_wins)]
+                # test_wins already computed above (Bug 27+06 fix)
 
                 if len(test_wins) == 0 or test_y_wins.sum() == 0:
                     continue
@@ -884,7 +1060,8 @@ def evaluate_all_models(
                     for vs in range(0, len(test_wins), 256):
                         ve = min(vs + 256, len(test_wins))
                         out = model(test_wins[vs:ve])
-                        preds_list.append(out[horizon].squeeze(-1).cpu())
+                        # Bug 04 fix: apply sigmoid at inference (model outputs logits)
+                        preds_list.append(torch.sigmoid(out[horizon].squeeze(-1)).cpu())
                     pinn_proba = torch.cat(preds_list).numpy()
 
                 try:
@@ -1007,30 +1184,44 @@ def compute_significance(
     test_X_norm = (test_X_raw - feat_mean) / feat_std
     test_wins = torch.from_numpy(prepare_windowed_data(test_X_norm)).to(device)
 
+    # Bug 08+09 fix: compute aligned indices once
+    win_indices_sig = get_window_target_indices(len(test_df), SEQ_LEN, STRIDE)
+    test_X_aligned_sig = test_X_raw[win_indices_sig]
+
     for horizon in HORIZONS:
         train_y = train_df[horizon].values
         test_y = test_df[horizon].values
-        test_y_wins = test_y[SEQ_LEN - 1::STRIDE][:len(test_wins)]
+        # Bug 09 fix: use explicit indices
+        test_y_wins = test_y[win_indices_sig]
         
         if test_y.sum() == 0 or test_y_wins.sum() == 0:
             continue
 
         rf_f1s, thresh_f1s, pinn_aurocs, lstm_aurocs, cnn_aurocs = [], [], [], [], []
+        rf_aurocs_sig = []
         
         for seed in SEEDS:
-            # RF
+            # RF — evaluated on aligned population (Bug 08 fix)
             rf = RandomForestClassifier(
                 n_estimators=200, max_depth=25, random_state=seed,
                 class_weight="balanced", n_jobs=RF_NJOBS,
             )
             rf.fit(train_X, train_y)
-            rf_f1s.append(f1_score(test_y, rf.predict(test_X_raw), zero_division=0))
+            rf_pred_aligned = rf.predict(test_X_aligned_sig)
+            rf_f1s.append(f1_score(test_y_wins, rf_pred_aligned, zero_division=0))
+            # RF AUROC for PINN vs RF test (Bug 28)
+            rf_proba_sig = rf.predict_proba(test_X_aligned_sig)
+            rf_proba_pos_sig = rf_proba_sig[:, 1] if rf_proba_sig.shape[1] == 2 else rf_proba_sig[:, 0]
+            try:
+                rf_aurocs_sig.append(roc_auc_score(test_y_wins, rf_proba_pos_sig))
+            except ValueError:
+                rf_aurocs_sig.append(0.5)
 
-            # Threshold
-            thresh_pred = (test_X_raw[:, v_col] < 26.5).astype(int)
-            thresh_f1s.append(f1_score(test_y, thresh_pred, zero_division=0))
+            # Threshold — also on aligned population
+            thresh_pred = (test_X_aligned_sig[:, v_col] < 26.5).astype(int)
+            thresh_f1s.append(f1_score(test_y_wins, thresh_pred, zero_division=0))
             
-            # PINN
+            # PINN — Bug 04 fix: apply sigmoid
             ckpt_pinn = os.path.join(CHECKPOINT_DIR, f"pinn_seed{seed}_best.pt")
             if os.path.exists(ckpt_pinn):
                 model = AVRPINN(n_input_features=n_features).to(device)
@@ -1039,7 +1230,7 @@ def compute_significance(
                 with torch.no_grad():
                     preds_list = []
                     for vs in range(0, len(test_wins), 256):
-                        preds_list.append(model(test_wins[vs:min(vs+256, len(test_wins))])[horizon].squeeze(-1).cpu())
+                        preds_list.append(torch.sigmoid(model(test_wins[vs:min(vs+256, len(test_wins))])[horizon].squeeze(-1)).cpu())
                     try:
                         pinn_aurocs.append(roc_auc_score(test_y_wins, torch.cat(preds_list).numpy()))
                     except ValueError:
@@ -1112,6 +1303,41 @@ def compute_significance(
                 results[horizon]["rf_vs_thresh"] = {"stat": float(stat), "p": float(p), "sig": p < 0.05}
             except Exception:
                 pass
+
+        # Bug 28 fix: Test 1C: PINN vs RF (AUROC) — the paper's PRIMARY claim
+        if len(pinn_aurocs) >= 2 and len(rf_aurocs_sig) >= 2:
+            min_len = min(len(pinn_aurocs), len(rf_aurocs_sig))
+            diffs_pinn_rf = [p - r for p, r in zip(pinn_aurocs[:min_len], rf_aurocs_sig[:min_len])]
+            if len(set(diffs_pinn_rf)) > 1 and all(d != 0 for d in diffs_pinn_rf):
+                try:
+                    stat, p = stats.wilcoxon(pinn_aurocs[:min_len], rf_aurocs_sig[:min_len],
+                                             alternative="greater")
+                    verdict = "✓ PINN>RF (p<0.05)" if p < 0.05 else f"✗ not sig (p={p:.4f})"
+                    print(f"  [{horizon}] PINN vs RF (AUROC): {verdict}")
+                    results[horizon]["pinn_vs_rf"] = {
+                        "pinn_mean": round(float(np.mean(pinn_aurocs)), 4),
+                        "rf_mean": round(float(np.mean(rf_aurocs_sig)), 4),
+                        "stat": float(stat), "p": float(p), "sig": bool(p < 0.05),
+                    }
+                except Exception as e:
+                    print(f"  [{horizon}] PINN vs RF: Wilcoxon failed ({e})")
+            else:
+                # Bug 14 fix: bootstrap CI fallback (more robust at n=5)
+                diffs_arr = np.array(diffs_pinn_rf)
+                rng_boot = np.random.default_rng(42)
+                boot_means = [
+                    np.mean(rng_boot.choice(diffs_arr, len(diffs_arr), replace=True))
+                    for _ in range(5000)
+                ]
+                ci_low = float(np.percentile(boot_means, 2.5))
+                ci_high = float(np.percentile(boot_means, 97.5))
+                sig = ci_low > 0.0
+                verdict = "✓ PINN>RF (CI above 0)" if sig else f"✗ CI includes 0 [{ci_low:.4f}, {ci_high:.4f}]"
+                print(f"  [{horizon}] PINN vs RF bootstrap: {verdict}")
+                results[horizon]["pinn_vs_rf"] = {
+                    "mean_diff": float(np.mean(diffs_arr)),
+                    "ci_low": ci_low, "ci_high": ci_high, "sig": sig,
+                }
 
     return results
 
@@ -1339,6 +1565,56 @@ def generate_figures(
         train_y = train_df["fault_10s"].values
 
         if test_y.sum() > 0:
+            # ─── Bug 31 fix: PINN ROC curve ──────────────────────
+            pinn_plotted = False
+            ckpt_path = os.path.join(CHECKPOINT_DIR, "pinn_seed42_best.pt")
+            if os.path.exists(ckpt_path):
+                try:
+                    from models.pinn import AVRPINN
+                    device = torch.device(
+                        "cuda" if torch.cuda.is_available() else "cpu"
+                    )
+                    n_features = len(feature_cols)
+                    model = AVRPINN(n_input_features=n_features).to(device)
+                    ckpt = torch.load(
+                        ckpt_path, map_location=device, weights_only=False
+                    )
+                    model.load_state_dict(ckpt["model_state_dict"])
+                    model.eval()
+
+                    # Normalize test data using training stats
+                    feat_mean = train_X.mean(axis=0)
+                    feat_std = train_X.std(axis=0) + 1e-8
+                    test_X_norm = (test_X - feat_mean) / feat_std
+                    test_wins = torch.from_numpy(
+                        prepare_windowed_data(test_X_norm)
+                    ).to(device)
+                    win_indices = get_window_target_indices(
+                        len(test_y), SEQ_LEN, STRIDE
+                    )
+                    test_y_wins = test_y[win_indices]
+
+                    if len(test_wins) > 0 and test_y_wins.sum() > 0:
+                        with torch.no_grad():
+                            preds = []
+                            for vs in range(0, len(test_wins), 256):
+                                ve = min(vs + 256, len(test_wins))
+                                out = model(test_wins[vs:ve])
+                                preds.append(
+                                    torch.sigmoid(out["fault_10s"].squeeze(-1)).cpu()
+                                )
+                            pinn_proba = torch.cat(preds).numpy()
+                        fpr_p, tpr_p, _ = roc_curve(test_y_wins, pinn_proba)
+                        auroc_p = roc_auc_score(test_y_wins, pinn_proba)
+                        ax.plot(
+                            fpr_p, tpr_p, color="#4CAF50", linewidth=2.5,
+                            label=f"PINN (AUC={auroc_p:.3f})",
+                        )
+                        pinn_plotted = True
+                except Exception as e:
+                    print(f"  [WARN] Could not plot PINN ROC: {e}")
+
+            # ─── RF ROC ──────────────────────────────────────────
             rf = RandomForestClassifier(
                 n_estimators=200, max_depth=25, random_state=42,
                 class_weight="balanced", n_jobs=RF_NJOBS,
@@ -1500,6 +1776,7 @@ def main() -> None:
     parser.add_argument("--evaluate", action="store_true", help="PHM metrics + significance")
     parser.add_argument("--shap", action="store_true", help="SHAP explainability")
     parser.add_argument("--figures", action="store_true", help="Publication figures")
+    parser.add_argument("--force", action="store_true", help="Proceed even if VVA gate fails")
     args = parser.parse_args()
 
     run_all = args.all or not any([args.train, args.evaluate, args.shap, args.figures])
@@ -1526,6 +1803,61 @@ def main() -> None:
         "max_epochs": MAX_EPOCHS,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }}
+
+    # ─── Bug 07 fix: Run VVA validation before training ─────────────────
+    if run_all or args.train:
+        try:
+            from data_gen.vva import run_full_vva
+            from data_gen.cgan import CGANGenerator, generate_augmentation_data
+
+            cgan_ckpt_path = os.path.join(CHECKPOINT_DIR, "cgan_latest.pt")
+            if os.path.exists(cgan_ckpt_path):
+                print("\n[VVA] Running synthetic data quality gate...")
+                # Build real windows from training split
+                train_idx = splits.get("train", np.array([]))
+                vva_cols = ["voltage_v", "current_a", "temperature_c"]
+                if len(train_idx) > 0 and all(c in df.columns for c in vva_cols):
+                    train_data = df.iloc[train_idx][vva_cols].values.astype(np.float32)
+                    n_vva = min(500, (len(train_data) - SEQ_LEN) // STRIDE)
+                    if n_vva > 50:
+                        real_seqs = np.array(
+                            [train_data[i * STRIDE: i * STRIDE + SEQ_LEN] for i in range(n_vva)]
+                        )
+                        # Load cGAN and generate synthetic sequences
+                        ckpt = torch.load(
+                            cgan_ckpt_path, map_location="cpu", weights_only=False
+                        )
+                        gen = CGANGenerator(
+                            latent_dim=32, condition_dim=ckpt["generator_state_dict"][
+                                "cond_proj.weight"
+                            ].shape[1],
+                        )
+                        gen.load_state_dict(ckpt["generator_state_dict"])
+                        # Generate with zeros condition (baseline healthy)
+                        cond_dim = gen.cond_proj.weight.shape[1]
+                        synth_seqs = generate_augmentation_data(
+                            gen, n_samples=n_vva,
+                            condition=np.zeros(cond_dim, dtype=np.float32),
+                        )
+                        vva_report = run_full_vva(real_seqs, synth_seqs)
+                        acceptance = vva_report.get("acceptance", {})
+                        mmd_ok = acceptance.get("mmd_pass", False)
+                        prop_ok = acceptance.get("propensity_pass", False)
+                        acf_ok = acceptance.get("acf_pass", False)
+                        all_pass = mmd_ok and prop_ok and acf_ok
+                        print(f"[VVA] MMD pass={mmd_ok}, Propensity pass={prop_ok}, "
+                              f"ACF pass={acf_ok} → {'ACCEPTED' if all_pass else 'REJECTED'}")
+                        if not all_pass and not args.force:
+                            raise RuntimeError(
+                                "[VVA] Synthetic data quality gate FAILED. "
+                                "Re-train cGAN or use --force to override."
+                            )
+                        elif not all_pass:
+                            print("[VVA] WARNING: Quality gate failed but --force is set, proceeding.")
+            else:
+                print("[VVA] No cGAN checkpoint found — skipping synthetic data validation.")
+        except ImportError as e:
+            print(f"[VVA] VVA module not available ({e}), skipping validation gate.")
 
     # ─── Step 1: Train ────────────────────────────────────────────
     if run_all or args.train:
